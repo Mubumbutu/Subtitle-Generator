@@ -1,6 +1,6 @@
 # Subtitle Generator
 
-A desktop application for generating subtitles (SRT) and plain-text transcriptions from audio and video files. Built in Python with a PyQt6 interface, using WhisperX for transcription and word-level timestamp alignment.
+A desktop application for generating subtitles (SRT) and plain-text transcriptions from audio and video files. Using WhisperX for transcription and word-level timestamp alignment.
 
 <img width="950" height="861" alt="subtitle" src="https://github.com/user-attachments/assets/6b3ea144-b121-4c56-8d18-cf0c70897e1f" />
 
