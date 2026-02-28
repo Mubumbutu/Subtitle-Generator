@@ -1,0 +1,26 @@
+# WhisperX Subtitle Generator v2.5 - Requirements
+# Python 3.10+ required
+
+# Core ML
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# WhisperX (installs faster-whisper, ctranslate2 etc.)
+whisperx
+
+# Audio processing
+sounddevice
+soundfile
+numpy
+
+# Subtitles
+pysrt
+
+# GUI
+PyQt6
+
+# Audio resampling (optional but recommended)
+librosa
+
+# Voice separation
+demucs
