@@ -280,23 +280,6 @@ Load file → (Optional) Select regions → Configure model → Generate → Sav
 
 ---
 
-## Project structure
-
-```
-subtitle_generator.py   Single-file application:
-                        - WaveformWidget    — waveform display, zoom/pan, region selection
-                        - AudioRecorder     — microphone recording via sounddevice
-                        - SubtitleGenerator — transcription (WhisperX), voice separation
-                                              (Demucs), SRT/TXT export
-                        - SubtitleGeneratorGUI — main PyQt6 window
-models/
-  whisperx/
-    <model_name>/       WhisperX transcription model (downloaded on first use)
-    align/<lang>/       Word-level alignment model (downloaded on first use)
-```
-
----
-
 ## Notes
 
 - **First run downloads models** — `large-v3` is approximately 3–5 GB. Ensure a stable connection or pre-download by running transcription once with the target model selected.
