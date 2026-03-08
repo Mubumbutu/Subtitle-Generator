@@ -64,12 +64,9 @@ Models are downloaded from HuggingFace Hub on first use and stored locally in `.
 
 Optional preprocessing step using **Demucs** (`--two-stems=vocals`). Extracts the vocal track from the audio before transcription, which can improve accuracy for files with background music or noise.
 
-- Demucs must be installed separately (`pip install demucs`)
 - Significantly increases processing time (2–5 minutes per file depending on length)
 - Output vocals are saved as MP3 (320 kbps) to a temporary directory and cleaned up after processing
 - Filenames with non-ASCII characters are handled via a safe copy before Demucs runs
-
-If Demucs is not found or fails, the application falls back to the original audio file and continues.
 
 ---
 
