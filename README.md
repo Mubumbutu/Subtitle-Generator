@@ -153,10 +153,6 @@ soundfile
 librosa
 pysrt
 numpy
-```
-
-Optional — required only for voice separation:
-```
 demucs
 ```
 
