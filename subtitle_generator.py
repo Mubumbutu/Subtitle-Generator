@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # subtitle_generator.py
+import os
+import sys
+os.environ["PATH"] = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Lib", "site-packages", "nvidia", "cudnn", "bin") + os.pathsep + os.environ.get("PATH", "")
+os.environ["PATH"] = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Lib", "site-packages", "nvidia", "cublas", "bin") + os.pathsep + os.environ["PATH"]
 import contextlib
 import ctypes
 import datetime
@@ -8,7 +12,6 @@ import io
 import librosa
 import logging
 import numpy as np
-import os
 import pysrt
 import queue
 import shutil
@@ -16,7 +19,6 @@ import sounddevice as sd
 import soundfile as sf
 import string
 import subprocess
-import sys
 import tempfile
 import time
 import torch
@@ -24,6 +26,13 @@ import torch.serialization
 import traceback
 import unicodedata
 import warnings
+_nvidia_base = os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "Lib", "site-packages", "nvidia")
+_dll_dirs = []
+if os.path.isdir(_nvidia_base):
+    for _pkg in os.listdir(_nvidia_base):
+        _bin = os.path.join(_nvidia_base, _pkg, "bin")
+        if os.path.isdir(_bin):
+            _dll_dirs.append(os.add_dll_directory(_bin))
 import whisperx
 from pathlib import Path
 from PyQt6.QtCore import pyqtSignal, QObject, QPointF, Qt, QTimer
@@ -121,14 +130,22 @@ def is_whisperx_model_cached(model_name: str) -> bool:
     if not model_path.exists() or not model_path.is_dir():
         return False
 
+    hf_dir = model_path / f"models--Systran--faster-whisper-{model_name}"
+    if hf_dir.exists() and hf_dir.is_dir():
+        snapshots_dir = hf_dir / "snapshots"
+        if snapshots_dir.exists():
+            for snapshot in snapshots_dir.iterdir():
+                if snapshot.is_dir():
+                    if (snapshot / "model.bin").exists() and (snapshot / "config.json").exists():
+                        return True
+        if (hf_dir / "model.bin").exists() and (hf_dir / "config.json").exists():
+            return True
+
     required_files = ["config.json", "model.bin"]
+    if all((model_path / f).exists() for f in required_files):
+        return True
 
-    optional_but_common = ["tokenizer.json", "vocabulary.txt", "preprocessor_config.json"]
-
-    if not all((model_path / f).exists() for f in required_files):
-        return False
-
-    return True
+    return False
 
 class WaveformWidget(QWidget):
     view_changed = pyqtSignal(float, float)
