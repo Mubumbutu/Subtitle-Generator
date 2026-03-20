@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
 title WhisperX Subtitle Generator - Installer
 color 0A
 
@@ -10,9 +11,9 @@ echo  ============================================================
 echo.
 
 :: ----------------------------------------------------------------
-:: [1] Sprawdz Python
+:: [1] Check Python
 :: ----------------------------------------------------------------
-echo [1/7] Checking Python...
+echo [1/8] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo  ERROR: Python not found!
@@ -24,10 +25,98 @@ if errorlevel 1 (
 for /f "tokens=*" %%i in ('python --version') do echo  Found: %%i
 
 :: ----------------------------------------------------------------
-:: [2] Utworz wirtualne srodowisko
+:: [2] GPU Detection
 :: ----------------------------------------------------------------
 echo.
-echo [2/7] Creating virtual environment (.venv)...
+echo [2/8] Detecting NVIDIA GPU...
+set GPU_FOUND=0
+set DRIVER_MAJOR=0
+nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    set GPU_FOUND=1
+    for /f "tokens=1 delims=." %%a in ('nvidia-smi --query-gpu=driver_version --format=csv 2^>nul ^| findstr /R "^[0-9]"') do (
+        set DRIVER_MAJOR=%%a
+        goto DRIVER_DONE
+    )
+)
+:DRIVER_DONE
+
+if !GPU_FOUND! EQU 1 (
+    echo  NVIDIA GPU detected.
+    echo  Driver major version: !DRIVER_MAJOR!
+    echo  Recommended: GPU ^(CUDA^)
+) else (
+    echo  No NVIDIA GPU detected.
+    echo  Recommended: CPU
+)
+echo.
+echo  Choose installation type:
+echo.
+echo   [1] CPU  (works everywhere^)
+echo   [2] GPU  (NVIDIA CUDA - faster transcription^)
+echo.
+:CHOICE
+set USER_CHOICE=
+set /p USER_CHOICE= Enter choice [1/2]: 
+if "%USER_CHOICE%"=="1" goto CPU_MODE
+if "%USER_CHOICE%"=="2" goto GPU_MODE
+echo  Invalid choice. Please enter 1 or 2.
+goto CHOICE
+
+:: ----------------------------------------------------------------
+:: CPU MODE
+:: ----------------------------------------------------------------
+:CPU_MODE
+set TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+set TORCH_VARIANT=CPU only
+set INSTALL_CUDNN=0
+goto CREATE_VENV
+
+:: ----------------------------------------------------------------
+:: GPU MODE
+:: ----------------------------------------------------------------
+:GPU_MODE
+if !GPU_FOUND! EQU 0 (
+    echo.
+    echo  WARNING: No NVIDIA GPU detected.
+    echo  Installing CPU version instead.
+    set TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+    set TORCH_VARIANT=CPU fallback ^(no GPU found^)
+    set INSTALL_CUDNN=0
+    goto CREATE_VENV
+)
+if !DRIVER_MAJOR! GEQ 550 (
+    set TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+    set TORCH_VARIANT=GPU CUDA 12.4
+    set INSTALL_CUDNN=1
+    goto CREATE_VENV
+)
+if !DRIVER_MAJOR! GEQ 525 (
+    set TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+    set TORCH_VARIANT=GPU CUDA 12.1
+    set INSTALL_CUDNN=1
+    goto CREATE_VENV
+)
+if !DRIVER_MAJOR! GEQ 450 (
+    set TORCH_INDEX_URL=https://download.pytorch.org/whl/cu118
+    set TORCH_VARIANT=GPU CUDA 11.8
+    set INSTALL_CUDNN=1
+    goto CREATE_VENV
+)
+echo  Driver version !DRIVER_MAJOR! is too old (minimum 450^).
+echo  Installing CPU version instead.
+set TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+set TORCH_VARIANT=CPU fallback ^(driver too old^)
+set INSTALL_CUDNN=0
+
+:: ----------------------------------------------------------------
+:: [3] Create virtual environment
+:: ----------------------------------------------------------------
+:CREATE_VENV
+echo.
+echo  Selected mode: !TORCH_VARIANT!
+echo.
+echo [3/8] Creating virtual environment (.venv^)...
 if exist ".venv" (
     echo  .venv already exists - skipping creation.
 ) else (
@@ -41,10 +130,10 @@ if exist ".venv" (
 )
 
 :: ----------------------------------------------------------------
-:: [3] Aktywuj venv i uaktualnij pip
+:: [4] Activate venv and upgrade pip
 :: ----------------------------------------------------------------
 echo.
-echo [3/7] Activating .venv and upgrading pip...
+echo [4/8] Activating .venv and upgrading pip...
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
     echo  ERROR: Could not activate virtual environment.
@@ -55,30 +144,25 @@ python -m pip install --upgrade pip --quiet
 echo  pip upgraded OK.
 
 :: ----------------------------------------------------------------
-:: [4] Zainstaluj PyTorch (CUDA 12.1)
+:: [5] Install PyTorch
 :: ----------------------------------------------------------------
 echo.
-echo [4/7] Installing PyTorch with CUDA 12.1 support...
+echo [5/8] Installing PyTorch ^(!TORCH_VARIANT!^)...
 echo  This may take several minutes...
-python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet
+python -m pip install torch torchaudio --index-url !TORCH_INDEX_URL! --quiet
 if errorlevel 1 (
-    echo  WARNING: CUDA build failed, falling back to CPU-only PyTorch...
-    python -m pip install torch torchaudio --quiet
-    if errorlevel 1 (
-        echo  ERROR: Failed to install PyTorch.
-        pause
-        exit /b 1
-    )
-    echo  CPU-only PyTorch installed.
+    echo  ERROR: Failed to install PyTorch.
+    pause
+    exit /b 1
 )
 echo  PyTorch installed OK.
 python -c "import torch; print('  CUDA available:', torch.cuda.is_available())"
 
 :: ----------------------------------------------------------------
-:: [5] Zainstaluj requirements.txt
+:: [6] Install requirements.txt
 :: ----------------------------------------------------------------
 echo.
-echo [5/7] Installing packages from requirements.txt...
+echo [6/8] Installing packages from requirements.txt...
 python -m pip install -r requirements.txt --quiet
 if errorlevel 1 (
     echo  ERROR: Some packages failed to install.
@@ -89,10 +173,30 @@ if errorlevel 1 (
 echo  All requirements installed OK.
 
 :: ----------------------------------------------------------------
-:: [6] Sprawdz FFmpeg
+:: [7] Install nvidia-cudnn-cu12 (GPU mode only)
 :: ----------------------------------------------------------------
 echo.
-echo [6/7] Checking FFmpeg (required for video files^)...
+if !INSTALL_CUDNN! EQU 1 (
+    echo [7/8] Installing nvidia-cudnn-cu12 ^(required for CUDA float16 inference^)...
+    echo  This may take a few minutes ~720 MB...
+    python -m pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 --quiet
+    if errorlevel 1 (
+        echo  WARNING: nvidia-cudnn-cu12 installation failed.
+        echo  CUDA float16 inference may not work.
+    ) else (
+        echo  nvidia-cudnn-cu12 installed OK.
+    )
+) else (
+    echo [7/8] Skipping nvidia-cudnn-cu12 ^(CPU mode - not needed^).
+)
+
+:: ----------------------------------------------------------------
+:: [8] Check FFmpeg + install Demucs
+:: ----------------------------------------------------------------
+echo.
+echo [8/8] Final checks...
+echo.
+echo  Checking FFmpeg ^(required for video files^)...
 ffmpeg -version >nul 2>&1
 if errorlevel 1 (
     echo  WARNING: FFmpeg not found in PATH!
@@ -105,11 +209,8 @@ if errorlevel 1 (
     echo  FFmpeg found OK.
 )
 
-:: ----------------------------------------------------------------
-:: [7] Zainstaluj Demucs
-:: ----------------------------------------------------------------
 echo.
-echo [7/7] Installing Demucs (voice separation^)...
+echo  Installing Demucs ^(voice separation^)...
 python -m pip install demucs --quiet
 if errorlevel 1 (
     echo  WARNING: Demucs installation failed. Voice separation will not work.
@@ -118,7 +219,7 @@ if errorlevel 1 (
 )
 
 :: ----------------------------------------------------------------
-:: Weryfikacja koncowa
+:: Final verification
 :: ----------------------------------------------------------------
 echo.
 echo  ============================================================
@@ -128,12 +229,15 @@ python -c "import whisperx; import PyQt6; import sounddevice; import pysrt; prin
 if errorlevel 1 (
     echo  WARNING: Some packages may be missing. Check errors above.
 )
+if !INSTALL_CUDNN! EQU 1 (
+    python -c "import nvidia.cudnn; print('  nvidia-cudnn-cu12 verified OK!')" 2>nul || echo  WARNING: nvidia-cudnn-cu12 not importable - CUDA float16 may not work.
+)
 
 call .venv\Scripts\deactivate.bat 2>nul
 
 echo.
 echo  ============================================================
-echo    Installation complete!
+echo    Installation complete! ^(!TORCH_VARIANT!^)
 echo    Run the app by double-clicking: launcher.vbs
 echo  ============================================================
 echo.
