@@ -1024,91 +1024,76 @@ class SubtitleGenerator:
 
         return result
 
-    def extract_words(self, segments):
-        words = []
-        for seg in segments:
-            if "words" in seg:
-                for w in seg["words"]:
-                    if w.get("start") is None or w.get("end") is None:
-                        continue
-                    words.append({
-                        "word": w["word"].strip(),
-                        "start": w["start"],
-                        "end": w["end"]
-                    })
-            else:
-                if seg.get("start") is not None and seg.get("end") is not None:
-                    text = seg.get("text", "").strip()
-                    if text:
-                        word_list = text.split()
-                        duration = seg["end"] - seg["start"]
-                        time_per_word = duration / len(word_list) if word_list else 0
-
-                        for i, word in enumerate(word_list):
-                            start = seg["start"] + (i * time_per_word)
-                            end = start + time_per_word
-                            words.append({
-                                "word": word,
-                                "start": start,
-                                "end": end
-                            })
-
-        return words
-
-    def create_subtitles(self, words):
+    def create_subtitles_from_segments(self, segments):
+        import re
         subs = pysrt.SubRipFile()
-        word_idx = 0
-        pattern_idx = 0
         sub_idx = 1
-
         word_pattern = self.config["word_pattern"]
-        pattern_len = len(word_pattern)
-        min_pause = self.config["min_pause"]
+        max_words_cap = max(word_pattern) * 2
         max_line_length = self.config["max_line_length"]
+        min_pause = self.config["min_pause"]
+        SENTENCE_END = re.compile(r'[.!?…]+$')
+        SOFT_BREAK = re.compile(r'[,;:]+$')
 
-        while word_idx < len(words):
-            max_words = word_pattern[pattern_idx % pattern_len]
-            pattern_idx += 1
+        def words_from_segment(seg):
+            if "words" in seg:
+                return [w for w in seg["words"] if w.get("start") is not None and w.get("end") is not None]
+            text = seg.get("text", "").strip()
+            if not text:
+                return []
+            word_list = text.split()
+            if not word_list:
+                return []
+            duration = seg["end"] - seg["start"]
+            tpw = duration / len(word_list)
+            return [{"word": w, "start": seg["start"] + i * tpw, "end": seg["start"] + (i + 1) * tpw}
+                    for i, w in enumerate(word_list)]
 
+        def flush_chunk(chunk):
+            nonlocal sub_idx
+            if not chunk:
+                return
+            text = " ".join(w["word"] for w in chunk)
+            text = self.split_lines(text, max_line_length)
+            subs.append(pysrt.SubRipItem(
+                index=sub_idx,
+                start=seconds_to_srt_time(chunk[0]["start"]),
+                end=seconds_to_srt_time(chunk[-1]["end"]),
+                text=text
+            ))
+            sub_idx += 1
+
+        for seg in segments:
+            words = words_from_segment(seg)
+            if not words:
+                continue
             chunk = []
-            start_time = None
-            end_time = None
-
-            for _ in range(max_words):
-                if word_idx >= len(words):
-                    break
-
-                w = words[word_idx]
-
+            for w in words:
                 if chunk:
                     pause = w["start"] - chunk[-1]["end"]
                     if pause > min_pause:
-                        break
-
+                        flush_chunk(chunk)
+                        chunk = []
                 chunk.append(w)
-                start_time = start_time or w["start"]
-                end_time = w["end"]
-                word_idx += 1
-
-            if not chunk:
-                continue
-
-            text = " ".join(w["word"] for w in chunk)
-            text = self.split_lines(text, max_line_length)
-
-            subs.append(
-                pysrt.SubRipItem(
-                    index=sub_idx,
-                    start=seconds_to_srt_time(start_time),
-                    end=seconds_to_srt_time(end_time),
-                    text=text
-                )
-            )
-            sub_idx += 1
+                raw = w["word"].strip()
+                if SENTENCE_END.search(raw):
+                    flush_chunk(chunk)
+                    chunk = []
+                    continue
+                if SOFT_BREAK.search(raw) and len(chunk) >= 3:
+                    flush_chunk(chunk)
+                    chunk = []
+                    continue
+                if len(chunk) >= max_words_cap:
+                    flush_chunk(chunk)
+                    chunk = []
+            flush_chunk(chunk)
 
         return self.merge_short_subs(subs)
 
     def merge_short_subs(self, subs):
+        import re
+        SENTENCE_END = re.compile(r'[.!?…]+$')
         merged = pysrt.SubRipFile()
         i = 0
         min_duration = self.config["min_duration"]
@@ -1116,10 +1101,13 @@ class SubtitleGenerator:
         while i < len(subs):
             cur = subs[i]
             duration_ms = cur.end.ordinal - cur.start.ordinal
+            last_word = cur.text.rstrip().split()[-1] if cur.text.strip() else ""
+            ends_sentence = bool(SENTENCE_END.search(last_word))
 
             can_merge = (
                 duration_ms < min_duration * 1000
                 and i + 1 < len(subs)
+                and not ends_sentence
             )
 
             if can_merge:
@@ -1241,7 +1229,6 @@ class SubtitleGenerator:
             temp_processed_file = Path(tempfile.gettempdir()) / f"processed_{audio_path.stem}.wav"
 
             try:
-
                 audio_data, sr = sf.read(str(audio_path), dtype='float32')
 
                 if output_format == 'txt' or (output_format == 'srt' and has_include):
@@ -1251,17 +1238,14 @@ class SubtitleGenerator:
                             start_sample = int(start * sr)
                             end_sample = int(end * sr)
                             segments.append(audio_data[start_sample:end_sample])
-
                         processed_audio = np.concatenate(segments)
                         self.log(f"   ✓ Extracted {len(include_ranges)} regions")
-
                     elif has_exclude:
                         mask = np.ones(len(audio_data), dtype=bool)
                         for start, end in exclude_ranges:
                             start_sample = int(start * sr)
                             end_sample = int(end * sr)
                             mask[start_sample:end_sample] = False
-
                         processed_audio = audio_data[mask]
                         self.log(f"   ✓ Excluded {len(exclude_ranges)} regions")
 
@@ -1271,7 +1255,6 @@ class SubtitleGenerator:
                         start_sample = int(start * sr)
                         end_sample = int(end * sr)
                         processed_audio[start_sample:end_sample] = 0.0
-
                     self.log(f"   ✓ Muted {len(exclude_ranges)} regions")
 
                 sf.write(str(temp_processed_file), processed_audio, sr)
@@ -1302,18 +1285,13 @@ class SubtitleGenerator:
 
             processing_time = (datetime.datetime.now() - processing_start_time).total_seconds()
             self.log(f"\n✓ Text export completed in {processing_time:.1f}s")
-
             return None
 
         else:
-            words = self.extract_words(segments)
+            subs = self.create_subtitles_from_segments(segments)
 
-            if not words:
-                raise RuntimeError("No words extracted — alignment may have failed")
-
-            self.log(f"▶ Extracted {len(words)} words")
-
-            subs = self.create_subtitles(words)
+            if not subs:
+                raise RuntimeError("No subtitles generated — alignment may have failed")
 
             subs.save(output_path, encoding="utf-8")
 
