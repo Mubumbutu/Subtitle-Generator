@@ -1029,11 +1029,13 @@ class SubtitleGenerator:
         subs = pysrt.SubRipFile()
         sub_idx = 1
         word_pattern = self.config["word_pattern"]
-        max_words_cap = max(word_pattern) * 2
+        max_words_cap = max(word_pattern) * 4
         max_line_length = self.config["max_line_length"]
         min_pause = self.config["min_pause"]
         SENTENCE_END = re.compile(r'[.!?…]+$')
         SOFT_BREAK = re.compile(r'[,;:]+$')
+
+        segments = self.merge_incomplete_segments(segments)
 
         def words_from_segment(seg):
             if "words" in seg:
@@ -1063,6 +1065,14 @@ class SubtitleGenerator:
             ))
             sub_idx += 1
 
+        def flush_at_best_boundary(chunk):
+            for i in range(len(chunk) - 1, 0, -1):
+                if SOFT_BREAK.search(chunk[i]["word"].strip()):
+                    flush_chunk(chunk[:i + 1])
+                    return chunk[i + 1:]
+            flush_chunk(chunk)
+            return []
+
         for seg in segments:
             words = words_from_segment(seg)
             if not words:
@@ -1085,8 +1095,15 @@ class SubtitleGenerator:
                     chunk = []
                     continue
                 if len(chunk) >= max_words_cap:
-                    flush_chunk(chunk)
+                    remainder = flush_at_best_boundary(chunk)
                     chunk = []
+                    for rw in remainder:
+                        if chunk:
+                            pause = rw["start"] - chunk[-1]["end"]
+                            if pause > min_pause:
+                                flush_chunk(chunk)
+                                chunk = []
+                        chunk.append(rw)
             flush_chunk(chunk)
 
         return self.merge_short_subs(subs)
@@ -1094,34 +1111,95 @@ class SubtitleGenerator:
     def merge_short_subs(self, subs):
         import re
         SENTENCE_END = re.compile(r'[.!?…]+$')
-        merged = pysrt.SubRipFile()
-        i = 0
         min_duration = self.config["min_duration"]
 
-        while i < len(subs):
-            cur = subs[i]
-            duration_ms = cur.end.ordinal - cur.start.ordinal
-            last_word = cur.text.rstrip().split()[-1] if cur.text.strip() else ""
-            ends_sentence = bool(SENTENCE_END.search(last_word))
+        items = list(subs)
+        changed = True
 
-            can_merge = (
-                duration_ms < min_duration * 1000
-                and i + 1 < len(subs)
-                and not ends_sentence
-            )
+        while changed:
+            changed = False
+            new_items = []
+            i = 0
+            while i < len(items):
+                cur = items[i]
+                duration_ms = cur.end.ordinal - cur.start.ordinal
+                last_word = cur.text.rstrip().split()[-1] if cur.text.strip() else ""
+                ends_sentence = bool(SENTENCE_END.search(last_word))
 
-            if can_merge:
-                nxt = subs[i + 1]
-                cur.text += " " + nxt.text
-                cur.end = nxt.end
-                merged.append(cur)
-                i += 2
-            else:
-                merged.append(cur)
+                if duration_ms < min_duration * 1000:
+                    if new_items:
+                        prev = new_items[-1]
+                        prev_last = prev.text.rstrip().split()[-1] if prev.text.strip() else ""
+                        prev_ends = bool(SENTENCE_END.search(prev_last))
+                        if not prev_ends:
+                            prev.text += " " + cur.text
+                            prev.end = cur.end
+                            i += 1
+                            changed = True
+                            continue
+                    if i + 1 < len(items) and not ends_sentence:
+                        nxt = items[i + 1]
+                        cur.text += " " + nxt.text
+                        cur.end = nxt.end
+                        new_items.append(cur)
+                        i += 2
+                        changed = True
+                        continue
+
+                new_items.append(cur)
                 i += 1
+            items = new_items
 
-        for idx, s in enumerate(merged, 1):
+        result = pysrt.SubRipFile()
+        for idx, s in enumerate(items, 1):
             s.index = idx
+            result.append(s)
+        return result
+
+    def merge_incomplete_segments(self, segments):
+        import re
+        SENTENCE_END = re.compile(r'[.!?…]+$')
+        FILLER = re.compile(
+            r'^(uh+|um+|hmm+|hm+|uh-huh|ah+|eh+|ohh+|err+|uhm+|mhm+|huh|yy+|ee+|eee+|mm+|öö+|äh+|öh+)$',
+            re.IGNORECASE
+        )
+
+        cleaned = []
+        for seg in segments:
+            if "words" not in seg:
+                cleaned.append(seg)
+                continue
+            filtered_words = [w for w in seg["words"] if not FILLER.match(w.get("word", "").strip())]
+            if not filtered_words:
+                continue
+            seg = dict(seg)
+            seg["words"] = filtered_words
+            seg["text"] = " ".join(w["word"] for w in filtered_words)
+            cleaned.append(seg)
+
+        merged = []
+        i = 0
+        while i < len(cleaned):
+            cur = dict(cleaned[i])
+            while i + 1 < len(cleaned):
+                cur_text = cur.get("text", "").strip()
+                last_word = cur_text.split()[-1] if cur_text else ""
+                if SENTENCE_END.search(last_word):
+                    break
+                nxt = cleaned[i + 1]
+                nxt_text = nxt.get("text", "").strip()
+                if not nxt_text:
+                    break
+                first_word = nxt_text.split()[0]
+                if first_word[0].isupper():
+                    break
+                cur["text"] = cur_text + " " + nxt_text
+                cur["end"] = nxt["end"]
+                if "words" in cur and "words" in nxt:
+                    cur["words"] = cur["words"] + nxt["words"]
+                i += 1
+            merged.append(cur)
+            i += 1
 
         return merged
 
