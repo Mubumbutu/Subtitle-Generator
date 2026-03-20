@@ -48,7 +48,7 @@ The application uses **WhisperX**, which runs a Whisper model for transcription 
 
 `.en` variants are English-only and faster for English audio.
 
-Models are downloaded from HuggingFace Hub on first use and stored locally in `./models/whisperx/<model_name>/`. The application checks for a complete local copy (`config.json` + `model.bin`) before attempting a download. Alignment models are stored in `./models/whisperx/align/<language_code>/`.
+Models are downloaded from HuggingFace Hub on first use and stored locally in `./models/whisperx/<model_name>/`. The application checks for a complete local copy before attempting a download. Alignment models are stored in `./models/whisperx/align/<language_code>/`.
 
 **Compute types selected automatically:**
 
@@ -57,6 +57,8 @@ Models are downloaded from HuggingFace Hub on first use and stored locally in `.
 | CUDA | ≥ sm_70 (RTX / Volta+) | float16 |
 | CUDA | < sm_70 | float32 |
 | CPU | — | int8 |
+
+> **Windows + CUDA note:** `float16` inference requires cuDNN DLLs (`cudnn_ops_infer64_8.dll` etc.). These are provided by the `nvidia-cudnn-cu12` pip package, installed automatically by `install.bat` when GPU mode is selected. The application registers the DLL paths at startup via `os.environ["PATH"]` — no manual configuration is needed.
 
 ---
 
@@ -146,7 +148,6 @@ The application includes a live recording feature backed by `sounddevice` + `sou
 
 ```
 PyQt6
-torch
 whisperx
 sounddevice
 soundfile
@@ -156,11 +157,15 @@ numpy
 demucs
 ```
 
+**torch** and **torchaudio** are installed separately with the correct CUDA/CPU variant — see Installation below.
+
+GPU mode additionally requires `nvidia-cudnn-cu12` and `nvidia-cublas-cu12`, installed automatically by `install.bat`.
+
 ---
 
 ## Installation
 
-### Windows
+### Windows (recommended — use the installer)
 
 1. Install **Python 3.10+** from [python.org](https://www.python.org/downloads/) — check *"Add Python to PATH"*.
 
@@ -176,35 +181,43 @@ demucs
    cd Subtitle-Generator
    ```
 
-4. Create a virtual environment and install dependencies:
+4. Run the installer:
    ```bat
-   python -m venv venv
-   venv\Scripts\activate
-   pip install -r requirements.txt
+   install.bat
    ```
+   The installer detects your NVIDIA GPU and driver version, asks whether to install CPU or GPU mode, creates a `.venv`, installs all dependencies, and — for GPU mode — installs `nvidia-cudnn-cu12` (~720 MB) required for `float16` CUDA inference.
 
-5. Install PyTorch with CUDA (GPU) or CPU-only:
-   ```bat
-   :: CPU:
-   pip install torch --index-url https://download.pytorch.org/whl/cpu
+### Windows (manual)
 
-   :: CUDA 12.4 (driver ≥ 550):
-   pip install torch --index-url https://download.pytorch.org/whl/cu124
+```bat
+python -m venv .venv
+.venv\Scripts\activate
 
-   :: CUDA 12.1 (driver ≥ 525):
-   pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 
-   :: CUDA 11.8 (driver ≥ 450):
-   pip install torch --index-url https://download.pytorch.org/whl/cu118
-   ```
-   Check your driver version with `nvidia-smi`.
+:: CPU:
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+:: CUDA 12.4 (driver >= 550):
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+:: CUDA 12.1 (driver >= 525):
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+:: CUDA 11.8 (driver >= 450):
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+:: GPU only - required for float16 inference:
+pip install nvidia-cudnn-cu12 nvidia-cublas-cu12
+```
+
+Check your driver version with `nvidia-smi`.
 
 ---
 
 ### Linux
 
 ```bash
-# FFmpeg
 sudo apt install ffmpeg   # Debian/Ubuntu
 # or: sudo dnf install ffmpeg
 
@@ -217,12 +230,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # CPU:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# GPU — CUDA 12.4 (driver ≥ 550):
-# pip install torch --index-url https://download.pytorch.org/whl/cu124
-
+# GPU - CUDA 12.4 (driver >= 550):
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
+
+> On Linux, cuDNN is typically available system-wide or bundled with PyTorch. `nvidia-cudnn-cu12` is a Windows-specific requirement.
 
 ---
 
@@ -238,7 +252,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 pip install -r requirements.txt
-pip install torch
+pip install torch torchaudio
 ```
 
 > CUDA is not available on macOS. Transcription runs on CPU only. Apple Silicon (M1/M2/M3) MPS acceleration is not explicitly configured.
@@ -250,7 +264,7 @@ pip install torch
 ```bash
 # Activate the virtual environment first:
 source venv/bin/activate        # Linux / macOS
-venv\Scripts\activate           # Windows
+.venv\Scripts\activate          # Windows
 
 python subtitle_generator.py
 ```
