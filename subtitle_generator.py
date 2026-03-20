@@ -147,6 +147,20 @@ def is_whisperx_model_cached(model_name: str) -> bool:
 
     return False
 
+def is_align_model_cached(language_code: str) -> bool:
+    align_dir = Path("./models/whisperx/align") / language_code
+    if not align_dir.exists() or not align_dir.is_dir():
+        return False
+    for entry in align_dir.iterdir():
+        if entry.is_dir() and entry.name.startswith("models--"):
+            snapshots_dir = entry / "snapshots"
+            if snapshots_dir.exists():
+                for snapshot in snapshots_dir.iterdir():
+                    if snapshot.is_dir():
+                        if (snapshot / "model.safetensors").exists() or (snapshot / "pytorch_model.bin").exists():
+                            return True
+    return False
+
 class WaveformWidget(QWidget):
     view_changed = pyqtSignal(float, float)
     seek_requested = pyqtSignal(float)
@@ -939,7 +953,6 @@ class SubtitleGenerator:
             )
 
         self.log(f"✓ Model loaded successfully")
-
         self.log("▶ Transcribing audio...")
 
         transcribe_kwargs = {
@@ -968,6 +981,16 @@ class SubtitleGenerator:
             align_cache_dir = Path("./models/whisperx/align") / detected_language
             align_cache_dir.mkdir(parents=True, exist_ok=True)
 
+            align_cached = is_align_model_cached(detected_language)
+            if align_cached:
+                self.log(f" ✓ Using locally cached alignment model for: {detected_language}")
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                os.environ["HF_DATASETS_OFFLINE"] = "1"
+            else:
+                self.log(f" Downloading alignment model for: {detected_language}...")
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
+
             with contextlib.redirect_stderr(io.StringIO()):
                 align_model, metadata = whisperx.load_align_model(
                     language_code=detected_language,
@@ -995,6 +1018,9 @@ class SubtitleGenerator:
         except Exception as e:
             self.log(f" ⚠️ Warning: Alignment failed ({str(e)})")
             self.log(" Continuing with unaligned timestamps...")
+        finally:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
 
         return result
 
@@ -2140,6 +2166,8 @@ class SubtitleGeneratorGUI(QMainWindow):
                             cmd,
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=120
                         )
 
@@ -2166,7 +2194,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 for attempt in range(max_retries):
                     try:
                         audio_data, sample_rate = sf.read(str(audio_file_to_load), dtype='float32')
-
                         if len(audio_data) > 0:
                             break
                     except Exception as load_err:
@@ -2213,7 +2240,6 @@ class SubtitleGeneratorGUI(QMainWindow):
             except Exception as e:
                 print(f"ERROR in waveform worker: {e}")
                 traceback.print_exc()
-
                 QTimer.singleShot(0, lambda: self.waveform_info.setText(f"Status: Error - {str(e)}"))
 
         print(f" Starting worker thread...")
