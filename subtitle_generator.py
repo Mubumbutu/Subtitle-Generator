@@ -1033,7 +1033,7 @@ class SubtitleGenerator:
         max_line_length = self.config["max_line_length"]
         min_pause = self.config["min_pause"]
         SENTENCE_END = re.compile(r'[.!?…]+$')
-        SOFT_BREAK = re.compile(r'[,;:]+$')
+        SOFT_BREAK = re.compile(r'[;:]+$')
 
         segments = self.merge_incomplete_segments(segments)
 
