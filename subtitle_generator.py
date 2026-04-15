@@ -2247,7 +2247,6 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.gain_check.toggled.connect(self._on_audio_proc_changed)
         self.gain_db_spin.valueChanged.connect(self._on_audio_proc_changed)
         self.bwe_combo.currentIndexChanged.connect(self._on_audio_proc_changed)
-        self.language_edit.textChanged.connect(self._on_audio_proc_changed)
         self.adjustSize()
 
     def _create_reuse_chunk_container(self, checkbox_style: str, spinbox_style: str, label_style: str) -> QWidget:
@@ -3301,7 +3300,6 @@ class SubtitleGeneratorGUI(QMainWindow):
 
     def _get_audio_proc_state(self):
         return (
-            self.language_edit.text().strip(),
             self.voice_separation_check.isChecked(),
             self.reuse_check.isChecked(),
             self.bwe_combo.currentData(),
