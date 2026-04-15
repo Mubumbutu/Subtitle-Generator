@@ -35,7 +35,7 @@ if os.path.isdir(_nvidia_base):
             _dll_dirs.append(os.add_dll_directory(_bin))
 import whisperx
 from pathlib import Path
-from PyQt6.QtCore import pyqtSignal, QObject, QPointF, Qt, QTimer
+from PyQt6.QtCore import pyqtSignal, QObject, QPointF, Qt, QTimer, QThread
 from PyQt6.QtGui import (
     QColor,
     QCursor,
@@ -56,6 +56,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -190,10 +191,12 @@ class WaveformWidget(QWidget):
         self.selection_end = 0.0
         self.selection_type = 'include'
 
+        self.selection_enabled = True
+
         self.setMinimumHeight(120)
         self.setMouseTracking(True)
         self.setBackgroundRole(QPalette.ColorRole.Base)
-        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333; border-radius: 4px;")
+        self.setStyleSheet("background-color: #161616; border: 1px solid #333333; border-radius: 4px;")
 
     def set_audio_data(self, audio_array: np.ndarray | None):
         if audio_array is None or len(audio_array) == 0:
@@ -355,11 +358,11 @@ class WaveformWidget(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
-        if self.audio_data is None: return
+        if self.audio_data is None:
+            return
 
         if event.button() == Qt.MouseButton.LeftButton:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                has_include = any(sel_type == 'include' for _, _, sel_type in self.selections)
+            if self.selection_enabled and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 has_exclude = any(sel_type == 'exclude' for _, _, sel_type in self.selections)
 
                 if has_exclude:
@@ -384,9 +387,8 @@ class WaveformWidget(QWidget):
                 self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
 
         elif event.button() == Qt.MouseButton.RightButton:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.selection_enabled and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 has_include = any(sel_type == 'include' for _, _, sel_type in self.selections)
-                has_exclude = any(sel_type == 'exclude' for _, _, sel_type in self.selections)
 
                 if has_include:
                     self.is_erasing = True
@@ -466,24 +468,41 @@ class WaveformWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#1e1e1e"))
-
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        mid_y = h / 2
+
+        painter.fillRect(0, 0, w, h, QColor("#161616"))
+
+        f = painter.font()
+        if f.pointSize() <= 0:
+            f.setPointSize(10)
+        painter.setFont(f)
 
         if self.audio_data is None:
-            painter.setPen(QColor("#666666"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No audio data loaded")
+            painter.setPen(QColor("#333333"))
+            painter.drawLine(0, h // 2, w, h // 2)
+            painter.setPen(QColor("#555555"))
+            f2 = QFont(f)
+            f2.setPointSize(9)
+            painter.setFont(f2)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No audio")
             return
+
+        ruler_h = 14 if self.duration > 0.0 else 0
+        wave_h = h - ruler_h
+        mid_y = wave_h / 2.0
+
+        visible_duration = self.duration / self.zoom_factor
+        view_start_time = self.offset * self.duration
 
         total_samples = len(self.audio_data)
         visible_samples = int(total_samples / self.zoom_factor)
         start_sample = int(self.offset * total_samples)
-
-        if start_sample < 0: start_sample = 0
+        if start_sample < 0:
+            start_sample = 0
         end_sample = start_sample + visible_samples
-        if end_sample > total_samples: end_sample = total_samples
+        if end_sample > total_samples:
+            end_sample = total_samples
 
         real_visible_count = end_sample - start_sample
 
@@ -500,7 +519,8 @@ class WaveformWidget(QWidget):
 
             if len(source_data) > w:
                 bin_size = len(source_data) // w
-                if bin_size < 1: bin_size = 1
+                if bin_size < 1:
+                    bin_size = 1
                 limit = (len(source_data) // bin_size) * bin_size
                 data_to_bin = source_data[:limit]
                 binned = data_to_bin.reshape(-1, bin_size)
@@ -510,89 +530,57 @@ class WaveformWidget(QWidget):
 
             count = len(plot_data)
             if count > 0:
-                x_indices = np.linspace(0, w, count)
-                heights = plot_data * (h / 2 * 0.95)
-
-                painter.setPen(QPen(QColor(0, 255, 0, 180), 1))
+                mx = float(np.max(plot_data)) if np.max(plot_data) > 0 else 1.0
+                plot_data = plot_data / mx
+                ma = mid_y - 3
+                bw = w / count
 
                 for i in range(count):
-                    x = int(x_indices[i])
-                    amp = int(heights[i])
-                    if amp < 1: amp = 1
-                    painter.drawLine(x, int(mid_y - amp), x, int(mid_y + amp))
+                    frac = i / count
+                    time_at_bar = view_start_time + frac * visible_duration
+                    bh = max(2, int(plot_data[i] * ma))
+                    x = int(i * bw)
+                    bwi = max(1, int(bw) - 1)
 
-                painter.setPen(QPen(QColor(100, 100, 100), 1))
-                painter.drawLine(0, int(mid_y), w, int(mid_y))
+                    if time_at_bar < self.playback_position:
+                        col = QColor("#2a6aaa")
+                        col.setAlpha(220)
+                    else:
+                        col = QColor("#1a4a7a")
+                        col.setAlpha(100)
 
-        painter.setPen(QColor("#aaaaaa"))
-        font = painter.font()
-        font.setPointSize(8)
-        painter.setFont(font)
-
-        visible_duration = self.duration / self.zoom_factor
-        view_start_time = self.offset * self.duration
-
-        if visible_duration < 5:      time_step = 0.5
-        elif visible_duration < 10:   time_step = 1.0
-        elif visible_duration < 30:   time_step = 5.0
-        elif visible_duration < 60:   time_step = 10.0
-        elif visible_duration < 300:  time_step = 30.0
-        else:                         time_step = 60.0
-
-        first_tick = (int(view_start_time / time_step) + 1) * time_step
-        current_tick = first_tick
-
-        while current_tick < view_start_time + visible_duration:
-            time_offset = current_tick - view_start_time
-            tick_x = int((time_offset / visible_duration) * w)
-
-            if 0 <= tick_x <= w:
-                if time_step < 1.0: val = f"{current_tick:.1f}s"
-                else:
-                    m, s = divmod(int(current_tick), 60)
-                    val = f"{m:02d}:{s:02d}"
-
-                painter.drawLine(tick_x, h, tick_x, h - 10)
-                painter.drawText(tick_x + 3, h - 2, val)
-
-            current_tick += time_step
+                    painter.fillRect(x, int(mid_y - bh), bwi, int(bh * 2), col)
 
         regions_to_draw = list(self.selections)
         if self.is_selecting:
-            regions_to_draw.append((min(self.selection_start, self.selection_end),
-                                    max(self.selection_start, self.selection_end),
-                                    self.selection_type))
+            regions_to_draw.append((
+                min(self.selection_start, self.selection_end),
+                max(self.selection_start, self.selection_end),
+                self.selection_type
+            ))
 
         if self.is_erasing:
             erase_start = min(self.selection_start, self.selection_end)
             erase_end = max(self.selection_start, self.selection_end)
-
             if erase_end > view_start_time and erase_start < (view_start_time + visible_duration):
                 s_offset = erase_start - view_start_time
                 e_offset = erase_end - view_start_time
-
                 x_start = int((s_offset / visible_duration) * w)
                 x_end = int((e_offset / visible_duration) * w)
-                width_rect = x_end - x_start
-                if width_rect < 1: width_rect = 1
-
+                width_rect = max(1, x_end - x_start)
                 painter.setBrush(QColor(128, 128, 128, 80))
                 painter.setPen(QPen(QColor(200, 200, 200, 150), 2, Qt.PenStyle.DashLine))
-                painter.drawRect(x_start, 0, width_rect, h)
+                painter.drawRect(x_start, 0, width_rect, wave_h)
                 painter.setPen(Qt.PenStyle.NoPen)
 
         for r_start, r_end, r_type in regions_to_draw:
             if r_end < view_start_time or r_start > (view_start_time + visible_duration):
                 continue
-
             s_offset = r_start - view_start_time
             e_offset = r_end - view_start_time
-
             x_start = int((s_offset / visible_duration) * w)
             x_end = int((e_offset / visible_duration) * w)
-
-            width_rect = x_end - x_start
-            if width_rect < 1: width_rect = 1
+            width_rect = max(1, x_end - x_start)
 
             if r_type == 'include':
                 painter.setBrush(QColor(75, 0, 130, 120))
@@ -602,25 +590,70 @@ class WaveformWidget(QWidget):
                 edge_color = QColor(220, 20, 60, 200)
 
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(x_start, 0, width_rect, h)
-
+            painter.drawRect(x_start, 0, width_rect, wave_h)
             painter.setPen(edge_color)
-            painter.drawLine(x_start, 0, x_start, h)
-            painter.drawLine(x_end, 0, x_end, h)
+            painter.drawLine(x_start, 0, x_start, wave_h)
+            painter.drawLine(x_end, 0, x_end, wave_h)
             painter.setPen(Qt.PenStyle.NoPen)
 
         if view_start_time <= self.playback_position <= view_start_time + visible_duration:
             cursor_rel = (self.playback_position - view_start_time) / visible_duration
             cursor_x = int(cursor_rel * w)
+            painter.setPen(QPen(QColor("#2a6aaa"), 2))
+            painter.drawLine(cursor_x, 0, cursor_x, wave_h)
 
-            painter.setPen(QPen(QColor("#ff0000"), 1))
-            painter.drawLine(cursor_x, 0, cursor_x, h)
-            painter.setBrush(QColor("#ff0000"))
-            painter.drawPolygon([
-                QPointF(cursor_x, 0),
-                QPointF(cursor_x - 5, 8),
-                QPointF(cursor_x + 5, 8)
-            ])
+        if self.duration > 0.0:
+            ruler_y = wave_h
+            painter.fillRect(0, ruler_y, w, ruler_h, QColor(14, 14, 14, 220))
+            painter.setPen(QColor(50, 50, 50))
+            painter.drawLine(0, ruler_y, w, ruler_y)
+
+            if visible_duration < 5:
+                time_step = 0.5
+            elif visible_duration < 10:
+                time_step = 1.0
+            elif visible_duration < 30:
+                time_step = 5.0
+            elif visible_duration < 60:
+                time_step = 10.0
+            elif visible_duration < 300:
+                time_step = 30.0
+            elif visible_duration <= 1800:
+                time_step = 60.0
+            elif visible_duration <= 5400:
+                time_step = 300.0
+            else:
+                time_step = 600.0
+
+            f_ruler = QFont("Consolas", 7)
+            painter.setFont(f_ruler)
+            fm = painter.fontMetrics()
+            last_lx = -999
+
+            first_tick = int(view_start_time / time_step) * time_step
+            t = first_tick
+            while t <= view_start_time + visible_duration + time_step:
+                if t < 0:
+                    t += time_step
+                    continue
+                time_offset = t - view_start_time
+                tick_x = int((time_offset / visible_duration) * w)
+                if 0 <= tick_x <= w:
+                    painter.setPen(QColor(80, 80, 80))
+                    painter.drawLine(tick_x, ruler_y, tick_x, ruler_y + 4)
+                    if time_step < 1.0:
+                        label = f"{t:.1f}s"
+                    else:
+                        mins = int(t) // 60
+                        secs = int(t) % 60
+                        label = f"{mins}:{secs:02d}"
+                    lw = fm.horizontalAdvance(label)
+                    lx = max(1, min(w - lw - 1, tick_x - lw // 2))
+                    if lx > last_lx + lw + 4:
+                        painter.setPen(QColor("#888888"))
+                        painter.drawText(lx, h - 2, label)
+                        last_lx = lx
+                t += time_step
 
 class AudioRecorder(QObject):
     vumeter_signal = pyqtSignal(float)
@@ -706,16 +739,16 @@ class SubtitleGenerator:
         self.config = config
         self.device = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         self.voice_separation_enabled = config.get("voice_separation", False)
-
+        self.reuse_enabled = config.get("reuse_enabled", False)
+        self.pedalboard_config = config.get("pedalboard", {})
+ 
         self.temp_vocals_file = None
+        self.temp_video_audio = None
         self.temp_demucs_dir = None
-
+        self.temp_pedalboard_file = None
+        self.final_processed_audio = None
+ 
         self.last_segments = None
-
-        if config.get("enable_tf32", False) and torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            self.log("  ✓ TF32 enabled (faster mode for Ampere+ GPUs)")
 
     def log(self, message):
         print(message, flush=True)
@@ -754,23 +787,16 @@ class SubtitleGenerator:
 
             def safe_filename(filename):
                 name = Path(filename).stem
-
                 name = unicodedata.normalize('NFKD', name)
                 name = name.encode('ASCII', 'ignore').decode('ASCII')
-
                 safe_chars = string.ascii_letters + string.digits + '-_'
                 name = ''.join(c if c in safe_chars else '_' for c in name)
-
                 while '__' in name:
                     name = name.replace('__', '_')
-
                 name = name.strip('_')
-
                 if not name:
                     name = 'audio'
-
                 name = name[:100]
-
                 return name
 
             safe_name = safe_filename(audio_path.name)
@@ -851,7 +877,6 @@ class SubtitleGenerator:
             if not vocals_file:
                 self.log("  ⚠️ WARNING: Vocals file not found in expected location")
                 self.log(f"  Searched in: {output_dir}")
-
                 self.log("  Directory contents:")
                 for item in output_dir.rglob("*"):
                     if item.is_file():
@@ -860,7 +885,21 @@ class SubtitleGenerator:
 
             vocals_size = vocals_file.stat().st_size / (1024*1024)
             self.log(f"  ✓ Vocals file size: {vocals_size:.2f} MB")
-            self.log(f"  Using MP3 directly (WhisperX supports MP3 natively)")
+
+            vocals_audio, vocals_sr = librosa.load(str(vocals_file), sr=None, mono=True)
+            vocals_audio = vocals_audio.astype(np.float32)
+
+            demucs_output_dir = Path("./demucs_outputs")
+            demucs_output_dir.mkdir(parents=True, exist_ok=True)
+            idx = 1
+            while True:
+                dest_name = f"{safe_name}_{idx:02d}.wav"
+                dest_path = demucs_output_dir / dest_name
+                if not dest_path.exists():
+                    break
+                idx += 1
+            sf.write(str(dest_path), vocals_audio, vocals_sr)
+            self.log(f"  ✓ Vocals saved to: {dest_path}")
 
             self.temp_vocals_file = vocals_file
             self.temp_demucs_dir = output_dir
@@ -869,7 +908,7 @@ class SubtitleGenerator:
             self.log("✓ VOICE SEPARATION COMPLETE")
             self.log("="*50 + "\n")
 
-            return vocals_file
+            return dest_path
 
         except Exception as e:
             self.log("\n" + "="*50)
@@ -883,21 +922,630 @@ class SubtitleGenerator:
             self.log("="*50 + "\n")
             return audio_path
 
-    def cleanup_temp_files(self):
+    def apply_pedalboard(self, audio_path: Path) -> Path:
+        try:
+            from pedalboard import Pedalboard, NoiseGate, HighpassFilter, Compressor, Gain
+ 
+            self.log("\n" + "="*50)
+            self.log("🎛️ AUDIO PROCESSING")
+            self.log("="*50)
+ 
+            pb_cfg = self.pedalboard_config
+            effects = []
+ 
+            if pb_cfg.get("noise_gate_enabled", False):
+                effects.append(NoiseGate(
+                    threshold_db=pb_cfg.get("noise_gate_threshold", -40.0),
+                    ratio=10.0,
+                    attack_ms=2.0,
+                    release_ms=pb_cfg.get("noise_gate_release", 200.0),
+                ))
+                self.log(
+                    f"  + NoiseGate  threshold={pb_cfg.get('noise_gate_threshold', -40.0)} dB"
+                    f"  release={pb_cfg.get('noise_gate_release', 200.0)} ms"
+                )
+ 
+            if pb_cfg.get("highpass_enabled", False):
+                effects.append(HighpassFilter(
+                    cutoff_frequency_hz=pb_cfg.get("highpass_cutoff", 80.0),
+                ))
+                self.log(f"  + HighpassFilter  cutoff={pb_cfg.get('highpass_cutoff', 80.0)} Hz")
+ 
+            if pb_cfg.get("compressor_enabled", False):
+                effects.append(Compressor(
+                    threshold_db=pb_cfg.get("compressor_threshold", -20.0),
+                    ratio=pb_cfg.get("compressor_ratio", 4.0),
+                ))
+                self.log(
+                    f"  + Compressor  threshold={pb_cfg.get('compressor_threshold', -20.0)} dB"
+                    f"  ratio={pb_cfg.get('compressor_ratio', 4.0)}:1"
+                )
+ 
+            if pb_cfg.get("gain_enabled", False):
+                gain_val = pb_cfg.get("gain_db", 0.0)
+                if gain_val != 0.0:
+                    effects.append(Gain(gain_db=gain_val))
+                    self.log(f"  + Gain  {gain_val:+.1f} dB")
+ 
+            if not effects:
+                self.log("  No effects enabled — skipping.")
+                self.log("="*50 + "\n")
+                return audio_path
+ 
+            audio_path = Path(audio_path)
+            self.log(f"▶ Input file: {audio_path.name}")
+            self.log(f"▶ File size: {audio_path.stat().st_size / (1024*1024):.2f} MB")
+ 
+            audio_data, sr = sf.read(str(audio_path), dtype='float32')
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data.mean(axis=1)
+ 
+            board = Pedalboard(effects)
+ 
+            duration = len(audio_data) / sr
+            self.log(f"▶ Processing {duration:.1f}s of audio at {sr} Hz...")
+            self.log("  This may take a moment depending on file length...")
+ 
+            start_time = datetime.datetime.now()
+            processed = board(audio_data, sr)
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            self.log(f"  ✓ Processing completed in {elapsed:.1f}s")
+ 
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_output = Path(tempfile.gettempdir()) / f"pedalboard_{timestamp}.wav"
+            sf.write(str(temp_output), processed, sr)
+            self.temp_pedalboard_file = temp_output
+ 
+            out_size = temp_output.stat().st_size / (1024*1024)
+            self.log(f"  ✓ Output saved: {temp_output.name} ({out_size:.2f} MB)")
+            self.log("="*50)
+            self.log("✓ AUDIO PROCESSING COMPLETE")
+            self.log("="*50 + "\n")
+ 
+            return temp_output
+ 
+        except ImportError:
+            self.log("  ⚠️ ERROR: pedalboard not installed!")
+            self.log("  Install with: pip install pedalboard")
+            self.log("  Continuing with original audio...")
+            return audio_path
+        except Exception as e:
+            self.log("\n" + "="*50)
+            self.log("⚠️ AUDIO PROCESSING FAILED")
+            self.log("="*50)
+            self.log(f"Error: {str(e)}")
+            self.log("\nFull traceback:")
+            self.log(traceback.format_exc())
+            self.log("="*50)
+            self.log("Continuing with original audio file...")
+            self.log("="*50 + "\n")
+            return audio_path
+
+    def _chunk_fixed(self, audio_data: np.ndarray, sr: int, chunk_sec: float) -> list:
+        chunk_samples = max(sr, int(chunk_sec * sr))
+        total = len(audio_data)
+        chunks = []
+        pos = 0
+        while pos < total:
+            end = min(pos + chunk_samples, total)
+            chunks.append(audio_data[pos:end].copy())
+            pos = end
+        return chunks
+
+    def _find_cut_point(self, audio_data: np.ndarray, sr: int, search_start: int, search_end: int) -> int:
+        segment = audio_data[search_start:search_end]
+        n = len(segment)
+        if n == 0:
+            return search_start
+        window_samples = max(1, int(0.05 * sr))
+        step = max(1, window_samples // 2)
+        min_rms = float('inf')
+        best_mid = n // 2
+        i = 0
+        while i + window_samples <= n:
+            w = segment[i:i + window_samples]
+            rms = float(np.dot(w, w) / window_samples) ** 0.5
+            if rms < min_rms:
+                min_rms = rms
+                best_mid = i + window_samples // 2
+            i += step
+        return search_start + best_mid
+
+    def _chunk_smart(self, audio_data: np.ndarray, sr: int, chunk_sec: float) -> list:
+        chunk_samples = max(sr, int(chunk_sec * sr))
+        half_chunk = max(1, chunk_samples // 2)
+        total = len(audio_data)
+        chunks = []
+        pos = 0
+        while pos < total:
+            ideal_end = pos + chunk_samples
+            if ideal_end >= total:
+                chunks.append(audio_data[pos:total].copy())
+                break
+            search_start = pos + half_chunk
+            search_end = ideal_end
+            if search_start >= search_end:
+                cut = ideal_end
+            else:
+                cut = self._find_cut_point(audio_data, sr, search_start, search_end)
+            cut = max(pos + 1, min(cut, total))
+            chunks.append(audio_data[pos:cut].copy())
+            pos = cut
+        return chunks
+
+    def _crossfade_join(self, a: np.ndarray, b: np.ndarray, fade_samples: int) -> np.ndarray:
+        fs = min(fade_samples, len(a) // 2, len(b) // 2)
+        if fs <= 0:
+            return np.concatenate([a, b])
+        fade_out = np.linspace(1.0, 0.0, fs, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, fs, dtype=np.float32)
+        overlap = a[-fs:] * fade_out + b[:fs] * fade_in
+        return np.concatenate([a[:-fs], overlap, b[fs:]])
+
+    def _crossfade_concat(self, chunks: list, sr: int, fade_ms: int = 30) -> np.ndarray:
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        if len(chunks) == 1:
+            return chunks[0].astype(np.float32)
+        fade_samples = int(fade_ms * sr / 1000)
+        result = chunks[0].astype(np.float32)
+        for chunk in chunks[1:]:
+            result = self._crossfade_join(result, chunk.astype(np.float32), fade_samples)
+        return result
+
+    def _is_reuse_model_ready(self, model_dir: Path) -> bool:
+        if not model_dir.exists() or not model_dir.is_dir():
+            return False
+        for f in model_dir.rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".ckpt", ".pt", ".pth", ".bin"):
+                return True
+            if f.name.lower() in ("inference.py", "enhance.py", "config.yaml", "config.yml"):
+                return True
+        return False
+
+    def apply_reuse(self, audio_path: Path) -> Path:
+        import re as _re
+        try:
+            self.log("\n" + "="*50)
+            self.log("🔊 RE-USE AUDIO ENHANCEMENT")
+            self.log("="*50)
+            model_dir = Path(self.config.get("reuse_model_dir", "./models/reuse")).resolve()
+            bwe = self.config.get("bwe", 0)
+            chunking_enabled = self.config.get("reuse_chunking_enabled", False)
+            chunk_mode = self.config.get("reuse_chunk_mode", "fixed")
+            chunk_seconds = float(self.config.get("reuse_chunk_seconds", 30.0))
+            if not self._is_reuse_model_ready(model_dir):
+                self.log(f"  RE-USE model not found at: {model_dir}")
+                self.log("  Downloading nvidia/RE-USE from Hugging Face...")
+                self.log("  This may take several minutes depending on your connection...")
+                try:
+                    from huggingface_hub import snapshot_download
+                    model_dir.mkdir(parents=True, exist_ok=True)
+                    snapshot_download(
+                        repo_id="nvidia/RE-USE",
+                        local_dir=str(model_dir),
+                        local_dir_use_symlinks=False,
+                    )
+                    self.log("  ✓ RE-USE model downloaded successfully")
+                except ImportError:
+                    self.log("  ⚠️ huggingface_hub is not installed.")
+                    self.log("  Install with: pip install huggingface_hub")
+                    self.log("  Continuing without RE-USE enhancement...")
+                    return audio_path
+                except Exception as dl_err:
+                    self.log(f"  ⚠️ Download failed: {dl_err}")
+                    self.log("  Continuing without RE-USE enhancement...")
+                    return audio_path
+            audio_path = Path(audio_path)
+            self.log(f"▶ Input file: {audio_path.name}")
+            self.log(f"▶ File size: {audio_path.stat().st_size / (1024*1024):.2f} MB")
+            if chunking_enabled:
+                self.log(f"▶ Chunking: {chunk_mode} ({chunk_seconds:.1f}s target per chunk)")
+            noisy_dir = model_dir / "noisy_audio"
+            enhanced_dir = model_dir / "enhanced_audio"
+            noisy_dir.mkdir(exist_ok=True)
+            enhanced_dir.mkdir(exist_ok=True)
+            for f in noisy_dir.iterdir():
+                if f.is_file():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+            for f in list(enhanced_dir.glob("*.wav")) + list(enhanced_dir.glob("*.flac")):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+            chunk_stems = None
+            sr_source = None
+            if chunking_enabled:
+                audio_data_full, sr_source = sf.read(str(audio_path), dtype='float32')
+                if len(audio_data_full.shape) > 1:
+                    audio_data_full = audio_data_full.mean(axis=1)
+                if chunk_mode == 'smart':
+                    chunks_data = self._chunk_smart(audio_data_full, sr_source, chunk_seconds)
+                else:
+                    chunks_data = self._chunk_fixed(audio_data_full, sr_source, chunk_seconds)
+                self.log(f"  ✓ Split into {len(chunks_data)} chunks")
+                chunk_stems = []
+                for i, chunk in enumerate(chunks_data):
+                    stem_i = f"{audio_path.stem}_chunk_{i:04d}"
+                    sf.write(str(noisy_dir / f"{stem_i}.wav"), chunk, sr_source)
+                    chunk_stems.append(stem_i)
+                    self.log(f"    Chunk {i + 1}/{len(chunks_data)}: {len(chunk) / sr_source:.2f}s")
+            else:
+                out_wav = noisy_dir / (audio_path.stem + ".wav")
+                if out_wav.resolve() != audio_path.resolve():
+                    shutil.copy2(str(audio_path), str(out_wav))
+            in_stem = audio_path.stem
+            parsed_env = {}
+
+            def find_script(names):
+                for name in names:
+                    p = model_dir / name
+                    if p.exists():
+                        return p
+                for name in names:
+                    found = list(model_dir.rglob(name))
+                    if found:
+                        return found[0]
+                return None
+
+            def parse_sh(sh_path):
+                try:
+                    text = sh_path.read_text(encoding="utf-8", errors="replace")
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if _re.search(r"\bpython\b", line, _re.I):
+                            line = _re.sub(r"\s*\\$", "", line).split("#")[0].strip()
+                            parts = line.split()
+                            cmd_parts = []
+                            for tok in parts:
+                                env_m = _re.match(r'^([A-Z_][A-Z0-9_]*)=(.*)', tok)
+                                if env_m and not cmd_parts:
+                                    parsed_env[env_m.group(1)] = env_m.group(2).strip("'\"")
+                                else:
+                                    if _re.fullmatch(r"python[\d.]*", tok, _re.I):
+                                        tok = sys.executable
+                                    cmd_parts.append(tok)
+                            return cmd_parts if cmd_parts else None
+                except Exception as ex:
+                    self.log(f"  parse_sh error: {ex}")
+                return None
+
+            def find_model_config():
+                priority = [
+                    "config.yaml", "config.yml", "model_config.yaml",
+                    "model_config.yml", "config.json"
+                ]
+                for name in priority:
+                    p = model_dir / name
+                    if p.exists():
+                        return p
+                for pat in ("*.yaml", "*.yml", "*.json"):
+                    for p in sorted(model_dir.rglob(pat)):
+                        if p.name.lower() in ("hparams.yaml", "hparams.yml"):
+                            continue
+                        try:
+                            with open(p, encoding="utf-8") as f:
+                                if p.suffix in (".yaml", ".yml"):
+                                    import yaml
+                                    data = yaml.safe_load(f)
+                                else:
+                                    import json
+                                    data = json.load(f)
+                            if isinstance(data, dict) and "stft_cfg" in data:
+                                return p
+                        except Exception:
+                            continue
+                return None
+
+            sh_path = find_script(["inference.sh"])
+            cmd = None
+            if sh_path:
+                cmd = parse_sh(sh_path)
+                self.log(f"  Parsed from {sh_path.name}: {cmd}")
+            if not cmd:
+                script = find_script([
+                    "inference.py", "enhance.py", "run_enhancement.py",
+                    "run_enhance.py", "infer.py", "main.py"
+                ])
+                if not script:
+                    raise RuntimeError(
+                        "Could not locate an inference script in the RE-USE model directory."
+                    )
+                cmd = [sys.executable, str(script)]
+                self.log(f"  Using script: {script.name}")
+            cmd_str = " ".join(str(c) for c in cmd)
+            if not any(x in cmd_str for x in [
+                "--input_folder", "--input_dir", "--noisy_dir", "--input_path"
+            ]):
+                cmd.extend(["--input_folder", str(noisy_dir.relative_to(model_dir))])
+            if not any(x in cmd_str for x in [
+                "--output_folder", "--output_dir", "--output_path", "--out_dir"
+            ]):
+                cmd.extend(["--output_folder", str(enhanced_dir.relative_to(model_dir))])
+            if "--checkpoint_file" not in cmd_str:
+                ckpt_exts = (".pt", ".pth", ".bin", ".ckpt", ".safetensors")
+                ckpt_candidates = []
+                for ext in ckpt_exts:
+                    ckpt_candidates.extend(list(model_dir.rglob(f"*{ext}")))
+                if ckpt_candidates:
+                    ckpt = max(ckpt_candidates, key=lambda f: f.stat().st_size)
+                    cmd.extend(["--checkpoint_file", str(ckpt.relative_to(model_dir))])
+                    self.log(f"  ✓ Found checkpoint: {ckpt.name} ({ckpt.stat().st_size / (1024*1024):.1f} MB)")
+                else:
+                    self.log("  ⚠️ No checkpoint file found in RE-USE model directory!")
+                    self.log("  Continuing without RE-USE enhancement...")
+                    return audio_path
+            if "--config" not in cmd_str:
+                cfg = find_model_config()
+                if cfg:
+                    cmd.extend(["--config", str(cfg.relative_to(model_dir))])
+            if bwe > 0 and "--BWE" not in cmd_str:
+                cmd.extend(["--BWE", str(bwe)])
+            self.log("▶ Running RE-USE inference...")
+            self.log(f"  Command: {' '.join(str(c) for c in cmd)}")
+            env = {**os.environ, "PYTHONPATH": str(model_dir)}
+            if parsed_env:
+                env.update(parsed_env)
+            start_time = datetime.datetime.now()
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(model_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                errors="replace"
+            )
+            for line in process.stdout:
+                stripped = line.strip()
+                if stripped:
+                    self.log(f"  {stripped}")
+            process.wait()
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"RE-USE inference failed with exit code {process.returncode}"
+                )
+            self.log(f"  ✓ RE-USE completed in {elapsed:.1f}s")
+            if chunking_enabled and chunk_stems:
+                chunk_results = []
+                for i, stem_i in enumerate(chunk_stems):
+                    out_files = [
+                        p for p in enhanced_dir.rglob("*")
+                        if p.is_file() and p.suffix.lower() in (".wav", ".flac") and p.stem == stem_i
+                    ]
+                    if not out_files:
+                        out_files = [
+                            p for p in enhanced_dir.rglob("*")
+                            if p.is_file() and p.suffix.lower() in (".wav", ".flac") and stem_i in p.stem
+                        ]
+                    if not out_files:
+                        raise FileNotFoundError(
+                            f"No enhanced output found for chunk: {stem_i}"
+                        )
+                    chunk_audio, chunk_sr = sf.read(str(out_files[0]), dtype='float32')
+                    if len(chunk_audio.shape) > 1:
+                        chunk_audio = chunk_audio.mean(axis=1)
+                    chunk_results.append((chunk_audio.astype(np.float32), chunk_sr))
+                    self.log(f"    Loaded chunk {i + 1}/{len(chunk_stems)}: {len(chunk_audio) / chunk_sr:.2f}s")
+                target_sr = chunk_results[0][1]
+                chunks_audio = []
+                for chunk_audio, chunk_sr in chunk_results:
+                    if chunk_sr != target_sr:
+                        try:
+                            chunk_audio = librosa.resample(chunk_audio, orig_sr=chunk_sr, target_sr=target_sr)
+                        except Exception:
+                            pass
+                    chunks_audio.append(chunk_audio.astype(np.float32))
+                final_audio = self._crossfade_concat(chunks_audio, target_sr, fade_ms=30)
+                final_sr = target_sr
+                self.log(
+                    f"  ✓ Crossfade-concatenated {len(chunks_audio)} chunks"
+                    f" → {len(final_audio) / final_sr:.2f}s total"
+                )
+            else:
+                out_files = [
+                    p for p in enhanced_dir.rglob("*")
+                    if p.suffix.lower() in (".wav", ".flac") and p.is_file()
+                ]
+                if not out_files:
+                    raise RuntimeError(f"No output file produced by RE-USE in {enhanced_dir}")
+                matched = [f for f in out_files if f.stem == in_stem]
+                src_out = matched[0] if matched else out_files[0]
+                final_audio, final_sr = sf.read(str(src_out), dtype='float32')
+                if len(final_audio.shape) > 1:
+                    final_audio = final_audio.mean(axis=1)
+                final_audio = final_audio.astype(np.float32)
+            reuse_output_dir = Path("./RE-USE_outputs")
+            reuse_output_dir.mkdir(parents=True, exist_ok=True)
+            idx = 1
+            while True:
+                dest_name = f"{audio_path.stem}_{idx:02d}.wav"
+                dest_path = reuse_output_dir / dest_name
+                if not dest_path.exists():
+                    break
+                idx += 1
+            sf.write(str(dest_path), final_audio, final_sr)
+            for f in list(enhanced_dir.glob("*.wav")) + list(enhanced_dir.glob("*.flac")):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+            try:
+                for f in noisy_dir.iterdir():
+                    if f.is_file():
+                        f.unlink()
+            except Exception:
+                pass
+            self.log(f"  ✓ Enhanced audio saved to: {dest_path}")
+            self.log("="*50)
+            self.log("✓ RE-USE ENHANCEMENT COMPLETE")
+            self.log("="*50 + "\n")
+            return dest_path
+        except Exception as e:
+            self.log("\n" + "="*50)
+            self.log("⚠️ RE-USE ENHANCEMENT FAILED")
+            self.log("="*50)
+            self.log(f"Error: {str(e)}")
+            self.log("\nFull traceback:")
+            self.log(traceback.format_exc())
+            self.log("="*50)
+            self.log("Continuing with original audio file...")
+            self.log("="*50 + "\n")
+            return audio_path
+
+    def prepare_audio(self, audio_path, include_ranges=None, exclude_ranges=None, audio_ready_callback=None):
+        if self.final_processed_audio and self.final_processed_audio.exists():
+            try:
+                self.final_processed_audio.unlink()
+            except Exception:
+                pass
+            self.final_processed_audio = None
+        video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v'}
+        if audio_path.suffix.lower() in video_extensions:
+            self.log("▶ Detected video file, extracting audio with FFmpeg...")
+            temp_video = Path(tempfile.gettempdir()) / f"temp_audio_{audio_path.stem}.wav"
+            try:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(audio_path),
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    str(temp_video)
+                ]
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=120
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+                self.temp_video_audio = temp_video
+                self.log(f" ✓ Audio extracted to temporary file: {temp_video.name}")
+                audio_path = temp_video
+            except Exception as e:
+                self.log(f" ⚠️ FFmpeg extraction failed: {e}")
+                raise
+        audio_data, sr = sf.read(str(audio_path), dtype='float32')
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+        if sr != 16000:
+            self.log(f"▶ Resampling from {sr}Hz to 16000Hz...")
+            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
+            self.log(" ✓ Resampling completed")
+        temp_normalized = Path(tempfile.gettempdir()) / f"normalized_{audio_path.stem}.wav"
+        sf.write(str(temp_normalized), audio_data, 16000)
+        audio_path = temp_normalized
+        has_include = include_ranges and len(include_ranges) > 0
+        has_exclude = exclude_ranges and len(exclude_ranges) > 0
+        if has_include and has_exclude:
+            self.log(" ⚠️ WARNING: Both include and exclude ranges specified!")
+            self.log(" ⚠️ Include ranges take priority - exclude ranges will be ignored.")
+            has_exclude = False
+            exclude_ranges = None
+        processed_audio_path = audio_path
+        temp_processed_file = None
+        needs_processing = has_include or has_exclude
+        if needs_processing:
+            self.log("▶ Processing audio regions...")
+            temp_processed_file = Path(tempfile.gettempdir()) / f"processed_{audio_path.stem}.wav"
+            try:
+                audio_data, sr = sf.read(str(audio_path), dtype='float32')
+                if has_include:
+                    segments = []
+                    for start, end in sorted(include_ranges, key=lambda x: x[0]):
+                        start_sample = int(start * sr)
+                        end_sample = int(end * sr)
+                        segments.append(audio_data[start_sample:end_sample])
+                    processed_audio = np.concatenate(segments)
+                    self.log(f" ✓ Extracted {len(include_ranges)} regions")
+                elif has_exclude:
+                    mask = np.ones(len(audio_data), dtype=bool)
+                    for start, end in exclude_ranges:
+                        start_sample = int(start * sr)
+                        end_sample = int(end * sr)
+                        mask[start_sample:end_sample] = False
+                    processed_audio = audio_data[mask]
+                    self.log(f" ✓ Excluded {len(exclude_ranges)} regions")
+                sf.write(str(temp_processed_file), processed_audio, sr)
+                processed_audio_path = temp_processed_file
+                self.log(f" ✓ Saved processed audio: {temp_processed_file.name}")
+            except Exception as e:
+                self.log(f" ⚠️ Error processing audio: {e}")
+                raise
+        if self.voice_separation_enabled:
+            processed_audio_path = self.separate_vocals(processed_audio_path)
+        if self.reuse_enabled:
+            processed_audio_path = self.apply_reuse(processed_audio_path)
+        pb_cfg = self.pedalboard_config
+        if any(pb_cfg.get(k, False) for k in [
+            "noise_gate_enabled", "highpass_enabled", "compressor_enabled", "gain_enabled"
+        ]):
+            processed_audio_path = self.apply_pedalboard(processed_audio_path)
+        if audio_ready_callback is not None:
+            try:
+                audio_ready_callback(str(processed_audio_path))
+            except Exception:
+                pass
+        if temp_processed_file and temp_processed_file.exists() and temp_processed_file != processed_audio_path:
+            try:
+                temp_processed_file.unlink()
+            except Exception:
+                pass
+        if temp_normalized.exists() and temp_normalized != processed_audio_path:
+            try:
+                temp_normalized.unlink()
+            except Exception:
+                pass
+        self.final_processed_audio = processed_audio_path
+        self.cleanup_temp_files(keep=self.final_processed_audio)
+        return processed_audio_path
+
+    def cleanup_temp_files(self, keep=None):
         self.log("\n▶ Cleaning up temporary files...")
 
         cleaned = False
 
-        if self.temp_vocals_file and self.temp_vocals_file.exists():
+        def remove_file_with_retry(file_path, max_retries=3, delay=0.5):
+            for attempt in range(max_retries):
+                try:
+                    file_path.unlink()
+                    return True
+                except Exception:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(delay)
+            return False
+
+        if self.temp_video_audio and self.temp_video_audio.exists() and self.temp_video_audio != keep:
+            try:
+                if remove_file_with_retry(self.temp_video_audio):
+                    self.log(f"  ✓ Removed: {self.temp_video_audio.name}")
+                    cleaned = True
+            except Exception as e:
+                self.log(f"  ⚠️ Could not remove {self.temp_video_audio.name}: {e}")
+
+        if self.temp_vocals_file and self.temp_vocals_file.exists() and self.temp_vocals_file != keep:
             try:
                 if not self.temp_demucs_dir or self.temp_demucs_dir not in self.temp_vocals_file.parents:
-                    self.temp_vocals_file.unlink()
-                    self.log(f"  ✓ Removed: {self.temp_vocals_file.name}")
-                    cleaned = True
+                    if remove_file_with_retry(self.temp_vocals_file):
+                        self.log(f"  ✓ Removed: {self.temp_vocals_file.name}")
+                        cleaned = True
             except Exception as e:
                 self.log(f"  ⚠️ Could not remove {self.temp_vocals_file.name}: {e}")
 
-        if self.temp_demucs_dir and self.temp_demucs_dir.exists():
+        skip_demucs = keep and self.temp_demucs_dir and self.temp_demucs_dir in keep.parents
+        if not skip_demucs and self.temp_demucs_dir and self.temp_demucs_dir.exists():
             try:
                 shutil.rmtree(self.temp_demucs_dir)
                 self.log(f"  ✓ Removed: {self.temp_demucs_dir.name}/ (includes vocals.mp3)")
@@ -912,6 +1560,14 @@ class SubtitleGenerator:
                 cleaned = True
             except Exception as e:
                 self.log(f"  ⚠️ Could not remove {self.temp_input_dir.name}: {e}")
+
+        if self.temp_pedalboard_file and self.temp_pedalboard_file.exists() and self.temp_pedalboard_file != keep:
+            try:
+                if remove_file_with_retry(self.temp_pedalboard_file):
+                    self.log(f"  ✓ Removed: {self.temp_pedalboard_file.name}")
+                    cleaned = True
+            except Exception as e:
+                self.log(f"  ⚠️ Could not remove {self.temp_pedalboard_file.name}: {e}")
 
         if not cleaned:
             self.log("  (No temporary files to clean)")
@@ -1033,7 +1689,7 @@ class SubtitleGenerator:
         max_line_length = self.config["max_line_length"]
         min_pause = self.config["min_pause"]
         SENTENCE_END = re.compile(r'[.!?…]+$')
-        SOFT_BREAK = re.compile(r'[;:]+$')
+        SOFT_BREAK = re.compile(r'[,;:]+$')
 
         segments = self.merge_incomplete_segments(segments)
 
@@ -1273,78 +1929,135 @@ class SubtitleGenerator:
         self.log(f"  ✓ Formatted into {paragraph_count} paragraphs")
         self.log(f"  ✓ Saved to: {output_path}")
 
-    def process(self, audio_path, output_path, model_size, include_ranges=None, exclude_ranges=None, output_format='srt'):
+    def process(self, audio_path, output_path, model_size, include_ranges=None, exclude_ranges=None, output_format='srt', audio_ready_callback=None, prebuilt_audio_path=None):
         global processing_start_time
         processing_start_time = datetime.datetime.now()
 
         self.log(f"\n▶ Starting processing: {audio_path.name}")
         self.log(f"   Output format: {output_format.upper()}")
 
-        has_include = include_ranges and len(include_ranges) > 0
-        has_exclude = exclude_ranges and len(exclude_ranges) > 0
-
-        if has_include and has_exclude:
-            self.log("   ⚠️ WARNING: Both include and exclude ranges specified!")
-            self.log("   ⚠️ Include ranges take priority - exclude ranges will be ignored.")
-            has_exclude = False
-            exclude_ranges = None
-
-        if has_include:
-            self.log(f"   Mode: INCLUDE {len(include_ranges)} selected regions")
-        elif has_exclude:
-            self.log(f"   Mode: EXCLUDE {len(exclude_ranges)} selected regions")
-        else:
-            self.log(f"   Mode: PROCESS ENTIRE FILE")
-
-        processed_audio_path = audio_path
         temp_processed_file = None
+        using_prebuilt = prebuilt_audio_path is not None and Path(prebuilt_audio_path).exists()
 
-        needs_processing = (output_format == 'txt' and (has_include or has_exclude)) or \
-                           (output_format == 'srt' and has_include)
+        if using_prebuilt:
+            self.log("   ✓ Reusing pre-built audio from Check Audio — skipping audio preparation")
+            processed_audio_path = Path(prebuilt_audio_path)
+            if audio_ready_callback is not None:
+                try:
+                    audio_ready_callback(str(processed_audio_path))
+                except Exception:
+                    pass
+        else:
+            has_include = include_ranges and len(include_ranges) > 0
+            has_exclude = exclude_ranges and len(exclude_ranges) > 0
 
-        if needs_processing:
-            self.log(f"▶ Processing audio regions...")
-            temp_processed_file = Path(tempfile.gettempdir()) / f"processed_{audio_path.stem}.wav"
+            if has_include and has_exclude:
+                self.log("   ⚠️ WARNING: Both include and exclude ranges specified!")
+                self.log("   ⚠️ Include ranges take priority - exclude ranges will be ignored.")
+                has_exclude = False
+                exclude_ranges = None
 
-            try:
-                audio_data, sr = sf.read(str(audio_path), dtype='float32')
+            if has_include:
+                self.log(f"   Mode: INCLUDE {len(include_ranges)} selected regions")
+            elif has_exclude:
+                self.log(f"   Mode: EXCLUDE {len(exclude_ranges)} selected regions")
+            else:
+                self.log(f"   Mode: PROCESS ENTIRE FILE")
 
-                if output_format == 'txt' or (output_format == 'srt' and has_include):
-                    if has_include:
-                        segments = []
-                        for start, end in sorted(include_ranges, key=lambda x: x[0]):
-                            start_sample = int(start * sr)
-                            end_sample = int(end * sr)
-                            segments.append(audio_data[start_sample:end_sample])
-                        processed_audio = np.concatenate(segments)
-                        self.log(f"   ✓ Extracted {len(include_ranges)} regions")
-                    elif has_exclude:
-                        mask = np.ones(len(audio_data), dtype=bool)
+            video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v'}
+            if audio_path.suffix.lower() in video_extensions:
+                self.log("▶ Detected video file, extracting audio with FFmpeg...")
+                temp_video = Path(tempfile.gettempdir()) / f"temp_audio_{audio_path.stem}.wav"
+                try:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(audio_path),
+                        "-vn",
+                        "-acodec", "pcm_s16le",
+                        "-ar", "16000",
+                        "-ac", "1",
+                        str(temp_video)
+                    ]
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        timeout=120
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+                    self.temp_video_audio = temp_video
+                    self.log(f"  ✓ Audio extracted to temporary file: {temp_video.name}")
+                    audio_path = temp_video
+                except Exception as e:
+                    self.log(f"  ⚠️ FFmpeg extraction failed: {e}")
+                    raise
+
+            processed_audio_path = audio_path
+
+            needs_processing = (output_format == 'txt' and (has_include or has_exclude)) or \
+                               (output_format == 'srt' and has_include)
+
+            if needs_processing:
+                self.log(f"▶ Processing audio regions...")
+                temp_processed_file = Path(tempfile.gettempdir()) / f"processed_{audio_path.stem}.wav"
+
+                try:
+                    audio_data, sr = sf.read(str(audio_path), dtype='float32')
+
+                    if output_format == 'txt' or (output_format == 'srt' and has_include):
+                        if has_include:
+                            segments = []
+                            for start, end in sorted(include_ranges, key=lambda x: x[0]):
+                                start_sample = int(start * sr)
+                                end_sample = int(end * sr)
+                                segments.append(audio_data[start_sample:end_sample])
+                            processed_audio = np.concatenate(segments)
+                            self.log(f"   ✓ Extracted {len(include_ranges)} regions")
+                        elif has_exclude:
+                            mask = np.ones(len(audio_data), dtype=bool)
+                            for start, end in exclude_ranges:
+                                start_sample = int(start * sr)
+                                end_sample = int(end * sr)
+                                mask[start_sample:end_sample] = False
+                            processed_audio = audio_data[mask]
+                            self.log(f"   ✓ Excluded {len(exclude_ranges)} regions")
+
+                    elif output_format == 'srt' and has_exclude:
+                        processed_audio = audio_data.copy()
                         for start, end in exclude_ranges:
                             start_sample = int(start * sr)
                             end_sample = int(end * sr)
-                            mask[start_sample:end_sample] = False
-                        processed_audio = audio_data[mask]
-                        self.log(f"   ✓ Excluded {len(exclude_ranges)} regions")
+                            processed_audio[start_sample:end_sample] = 0.0
+                        self.log(f"   ✓ Muted {len(exclude_ranges)} regions")
 
-                elif output_format == 'srt' and has_exclude:
-                    processed_audio = audio_data.copy()
-                    for start, end in exclude_ranges:
-                        start_sample = int(start * sr)
-                        end_sample = int(end * sr)
-                        processed_audio[start_sample:end_sample] = 0.0
-                    self.log(f"   ✓ Muted {len(exclude_ranges)} regions")
+                    sf.write(str(temp_processed_file), processed_audio, sr)
+                    processed_audio_path = temp_processed_file
+                    self.log(f"   ✓ Saved processed audio: {temp_processed_file.name}")
 
-                sf.write(str(temp_processed_file), processed_audio, sr)
-                processed_audio_path = temp_processed_file
-                self.log(f"   ✓ Saved processed audio: {temp_processed_file.name}")
+                except Exception as e:
+                    self.log(f"   ⚠️ Error processing audio: {e}")
+                    raise
 
-            except Exception as e:
-                self.log(f"   ⚠️ Error processing audio: {e}")
-                raise
+            if self.voice_separation_enabled:
+                processed_audio_path = self.separate_vocals(processed_audio_path)
 
-        if self.voice_separation_enabled:
-            processed_audio_path = self.separate_vocals(processed_audio_path)
+            if self.reuse_enabled:
+                processed_audio_path = self.apply_reuse(processed_audio_path)
+
+            pb_cfg = self.pedalboard_config
+            if any(pb_cfg.get(k, False) for k in [
+                "noise_gate_enabled", "highpass_enabled", "compressor_enabled", "gain_enabled"
+            ]):
+                processed_audio_path = self.apply_pedalboard(processed_audio_path)
+
+            if audio_ready_callback is not None:
+                try:
+                    audio_ready_callback(str(processed_audio_path))
+                except Exception:
+                    pass
 
         result = self.transcribe(processed_audio_path, model_size)
         segments = result["segments"]
@@ -1357,9 +2070,10 @@ class SubtitleGenerator:
         if output_format == 'txt':
             self.export_text(segments, output_path)
 
-            if temp_processed_file and temp_processed_file.exists():
-                temp_processed_file.unlink()
-            self.cleanup_temp_files()
+            if not using_prebuilt:
+                if temp_processed_file and temp_processed_file.exists():
+                    temp_processed_file.unlink()
+                self.cleanup_temp_files()
 
             processing_time = (datetime.datetime.now() - processing_start_time).total_seconds()
             self.log(f"\n✓ Text export completed in {processing_time:.1f}s")
@@ -1382,9 +2096,10 @@ class SubtitleGenerator:
             self.log(f"  Average subtitle: {avg_duration:.2f}s")
             self.log(f"  Total processing time: {processing_time:.1f}s")
 
-            if temp_processed_file and temp_processed_file.exists():
-                temp_processed_file.unlink()
-            self.cleanup_temp_files()
+            if not using_prebuilt:
+                if temp_processed_file and temp_processed_file.exists():
+                    temp_processed_file.unlink()
+                self.cleanup_temp_files()
 
             return subs
 
@@ -1392,14 +2107,18 @@ class WorkerSignals(QObject):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
     text_exported = pyqtSignal(str)
+    whisper_audio_ready = pyqtSignal(str)
+    check_audio_done = pyqtSignal()
 
 class SubtitleGeneratorGUI(QMainWindow):
     audio_loaded_signal = pyqtSignal(np.ndarray)
+    whisper_audio_loaded_signal = pyqtSignal(np.ndarray)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Subtitle Generator by Mubumbutu")
-        self.setMinimumSize(950, 300)
+        self.setMinimumSize(1050, 300)
+        self.setAcceptDrops(True)
 
         self.input_file = None
         self.output_file = None
@@ -1412,9 +2131,26 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.playback_thread = None
         self.stop_playback_flag = False
 
+        self.whisper_audio_data = None
+        self.whisper_playing = False
+        self.whisper_current_position = 0
+        self.whisper_playback_thread = None
+        self.whisper_stop_playback_flag = False
+
         self._updating_from_waveform = False
 
+        self._last_checked_audio_proc_state = None
+        self._audio_proc_waveform_ready = False
+        self._cached_processed_audio_path = None
+        self._cached_audio_include_ranges = None
+        self._cached_audio_exclude_ranges = None
+
+        self._io_user_opened = False
+        self._waveform_user_opened = False
+        self._whisper_user_opened = False
+
         self.audio_loaded_signal.connect(self._update_waveform_data)
+        self.whisper_audio_loaded_signal.connect(self._update_whisper_waveform_data)
 
         if parent is None:
             self.init_ui()
@@ -1425,13 +2161,10 @@ class SubtitleGeneratorGUI(QMainWindow):
         layout = QVBoxLayout(main_widget)
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
-
         layout.addWidget(self.create_main_tab())
-
         self.button_container = QWidget()
         button_layout = QHBoxLayout(self.button_container)
         button_layout.setContentsMargins(0, 0, 0, 0)
-
         self.process_btn = QPushButton("🚀 Generate Subtitles (.srt)")
         self.process_btn.setMinimumHeight(40)
         self.process_btn.setStyleSheet("""
@@ -1451,7 +2184,6 @@ class SubtitleGeneratorGUI(QMainWindow):
         """)
         self.process_btn.clicked.connect(self.start_processing)
         button_layout.addWidget(self.process_btn)
-
         self.export_text_btn = QPushButton("📄 Export as Text (.txt)")
         self.export_text_btn.setMinimumHeight(40)
         self.export_text_btn.setStyleSheet("""
@@ -1471,16 +2203,120 @@ class SubtitleGeneratorGUI(QMainWindow):
         """)
         self.export_text_btn.clicked.connect(self.start_text_export)
         button_layout.addWidget(self.export_text_btn)
-
+        self.check_audio_btn = QPushButton("🎧 Check Audio")
+        self.check_audio_btn.setMinimumHeight(40)
+        self.check_audio_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6A1B9A;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #4A148C;
+            }
+            QPushButton:disabled {
+                background-color: #333;
+                color: #666;
+            }
+        """)
+        self.check_audio_btn.clicked.connect(self.start_check_audio)
+        self.check_audio_btn.setVisible(False)
+        button_layout.addWidget(self.check_audio_btn)
         self.button_container.setVisible(False)
         layout.addWidget(self.button_container)
-
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(False)
         layout.addWidget(self.progress_bar)
-
+        self.voice_separation_check.toggled.connect(self._on_audio_proc_changed)
+        self.reuse_check.toggled.connect(self._on_reuse_toggled)
+        self.reuse_fixed_check.toggled.connect(self._on_audio_proc_changed)
+        self.reuse_smart_check.toggled.connect(self._on_audio_proc_changed)
+        self.reuse_fixed_sec_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.reuse_smart_sec_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.ng_check.toggled.connect(self._on_audio_proc_changed)
+        self.ng_threshold_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.ng_release_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.hp_check.toggled.connect(self._on_audio_proc_changed)
+        self.hp_cutoff_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.comp_check.toggled.connect(self._on_audio_proc_changed)
+        self.comp_threshold_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.comp_ratio_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.gain_check.toggled.connect(self._on_audio_proc_changed)
+        self.gain_db_spin.valueChanged.connect(self._on_audio_proc_changed)
+        self.bwe_combo.currentIndexChanged.connect(self._on_audio_proc_changed)
+        self.language_edit.textChanged.connect(self._on_audio_proc_changed)
         self.adjustSize()
+
+    def _create_reuse_chunk_container(self, checkbox_style: str, spinbox_style: str, label_style: str) -> QWidget:
+        container = QWidget()
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setContentsMargins(0, 2, 0, 4)
+        outer_layout.setSpacing(4)
+
+        chunk_grid = QGridLayout()
+        chunk_grid.setSpacing(8)
+        chunk_grid.setColumnMinimumWidth(0, 210)
+        chunk_grid.setColumnMinimumWidth(1, 100)
+        chunk_grid.setColumnStretch(2, 1)
+
+        self.reuse_fixed_check = QCheckBox("Fixed chunking:")
+        self.reuse_fixed_check.setChecked(False)
+        self.reuse_fixed_check.setStyleSheet(checkbox_style)
+        self.reuse_fixed_check.setToolTip(
+            "Split audio into equal fixed-length segments before RE-USE.\n"
+            "Each segment is enhanced separately, then joined with crossfade.\n"
+            "Hard cuts — segments are exactly N seconds long."
+        )
+        self.reuse_fixed_sec_spin = QDoubleSpinBox()
+        self.reuse_fixed_sec_spin.setRange(5.0, 600.0)
+        self.reuse_fixed_sec_spin.setValue(15.0)
+        self.reuse_fixed_sec_spin.setSuffix(" s")
+        self.reuse_fixed_sec_spin.setSingleStep(5.0)
+        self.reuse_fixed_sec_spin.setFixedWidth(100)
+        self.reuse_fixed_sec_spin.setStyleSheet(spinbox_style)
+        self.reuse_fixed_sec_spin.setEnabled(False)
+        fixed_hint = QLabel("(split every N seconds, hard cuts)")
+        fixed_hint.setStyleSheet(label_style)
+
+        chunk_grid.addWidget(self.reuse_fixed_check, 0, 0)
+        chunk_grid.addWidget(self.reuse_fixed_sec_spin, 0, 1)
+        chunk_grid.addWidget(fixed_hint, 0, 2)
+
+        self.reuse_smart_check = QCheckBox("Smart chunking:")
+        self.reuse_smart_check.setChecked(False)
+        self.reuse_smart_check.setStyleSheet(checkbox_style)
+        self.reuse_smart_check.setToolTip(
+            "Split audio at the quietest detected point within each N-second window.\n"
+            "Searches the second half of each window for the lowest RMS frame.\n"
+            "Reduces the chance of cutting mid-word. Falls back to hard cut if needed."
+        )
+        self.reuse_smart_sec_spin = QDoubleSpinBox()
+        self.reuse_smart_sec_spin.setRange(5.0, 600.0)
+        self.reuse_smart_sec_spin.setValue(15.0)
+        self.reuse_smart_sec_spin.setSuffix(" s")
+        self.reuse_smart_sec_spin.setSingleStep(5.0)
+        self.reuse_smart_sec_spin.setFixedWidth(100)
+        self.reuse_smart_sec_spin.setStyleSheet(spinbox_style)
+        self.reuse_smart_sec_spin.setEnabled(False)
+        smart_hint = QLabel("(split at quietest point within N seconds)")
+        smart_hint.setStyleSheet(label_style)
+
+        chunk_grid.addWidget(self.reuse_smart_check, 1, 0)
+        chunk_grid.addWidget(self.reuse_smart_sec_spin, 1, 1)
+        chunk_grid.addWidget(smart_hint, 1, 2)
+
+        outer_layout.addLayout(chunk_grid)
+
+        self.reuse_fixed_check.toggled.connect(self.reuse_fixed_sec_spin.setEnabled)
+        self.reuse_fixed_check.toggled.connect(self._on_reuse_fixed_toggled)
+        self.reuse_smart_check.toggled.connect(self.reuse_smart_sec_spin.setEnabled)
+        self.reuse_smart_check.toggled.connect(self._on_reuse_smart_toggled)
+
+        container.setVisible(False)
+        return container
 
     def create_main_tab(self):
         widget = QWidget()
@@ -1488,29 +2324,6 @@ class SubtitleGeneratorGUI(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
         layout.setContentsMargins(10, 10, 10, 10)
-
-        GROUPBOX_STYLE = """
-            QGroupBox {
-                background-color: #1c1c1c;
-                border: 1px solid #2e2e2e;
-                border-radius: 5px;
-                margin-top: 8px;
-                padding-top: 8px;
-                color: #aaaaaa;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 6px;
-                color: #888888;
-                font-size: 11px;
-                letter-spacing: 1px;
-                text-transform: uppercase;
-            }
-        """
-
         BTN_STYLE = """
             QPushButton {
                 background-color: #2a2a2a;
@@ -1524,9 +2337,7 @@ class SubtitleGeneratorGUI(QMainWindow):
             QPushButton:pressed { background-color: #1a1a1a; }
             QPushButton:disabled { background-color: #222; color: #555; border-color: #333; }
         """
-
         LABEL_STYLE = "color: #888888; font-size: 11px;"
-
         INPUT_STYLE = """
             QLineEdit {
                 background-color: #161616;
@@ -1538,7 +2349,6 @@ class SubtitleGeneratorGUI(QMainWindow):
             }
             QLineEdit:focus { border-color: #2a6aaa; }
         """
-
         PROGRESSBAR_STYLE = """
             QProgressBar {
                 background-color: #1a1a1a;
@@ -1550,7 +2360,6 @@ class SubtitleGeneratorGUI(QMainWindow):
             }
             QProgressBar::chunk { background-color: #2a6aaa; border-radius: 2px; }
         """
-
         RADIO_STYLE = """
             QRadioButton {
                 color: #cccccc;
@@ -1577,7 +2386,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 background-color: #1a1a1a;
             }
         """
-
         CHECKBOX_STYLE = """
             QCheckBox {
                 color: #cccccc;
@@ -1604,7 +2412,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 background-color: #2a5a9a;
             }
         """
-
         SPINBOX_STYLE = """
             QSpinBox, QDoubleSpinBox {
                 background-color: #1e1e1e;
@@ -1653,7 +2460,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 border-top: 5px solid #aaa;
             }
         """
-
         COMBO_STYLE = """
             QComboBox {
                 padding: 4px 8px;
@@ -1670,7 +2476,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 selection-background-color: #3a5a8a;
             }
         """
-
         TOGGLE_BTN_STYLE = """
             QPushButton {
                 background-color: #2e2e2e;
@@ -1685,22 +2490,47 @@ class SubtitleGeneratorGUI(QMainWindow):
             QPushButton:checked { background-color: #1e3a5f; border-color: #2a6aaa; color: white; }
             QPushButton:hover { background-color: #3a3a3a; color: white; }
         """
-
+        CONTENT_GROUP_STYLE = """
+            QGroupBox {
+                background-color: #1c1c1c;
+                border: 1px solid #2e2e2e;
+                border-radius: 4px;
+                margin-top: 0px;
+            }
+        """
         def make_label(text):
             lbl = QLabel(text)
             lbl.setStyleSheet(LABEL_STYLE)
             return lbl
+        def make_fixed_label(text, width):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(LABEL_STYLE)
+            lbl.setFixedWidth(width)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return lbl
 
-        file_group = QGroupBox("Input / Output & Recording")
-        file_group.setStyleSheet(GROUPBOX_STYLE)
-        file_layout = QVBoxLayout()
-        file_layout.setSpacing(8)
-        file_layout.setContentsMargins(10, 14, 10, 10)
-
+        # ─────────────────────────────────────────────────
+        # INPUT / OUTPUT SECTION
+        # ─────────────────────────────────────────────────
+        io_container = QWidget()
+        io_container.setStyleSheet("background: transparent;")
+        io_main_layout = QVBoxLayout(io_container)
+        io_main_layout.setContentsMargins(0, 0, 0, 0)
+        io_main_layout.setSpacing(4)
+        self.io_toggle = QPushButton("▼ 📁 Input / Output")
+        self.io_toggle.setCheckable(True)
+        self.io_toggle.setChecked(True)
+        self.io_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
+        self.io_toggle.clicked.connect(self.toggle_io_section)
+        io_main_layout.addWidget(self.io_toggle)
+        self.io_content = QGroupBox()
+        self.io_content.setStyleSheet(CONTENT_GROUP_STYLE)
+        io_content_layout = QVBoxLayout()
+        io_content_layout.setSpacing(8)
+        io_content_layout.setContentsMargins(10, 14, 10, 10)
         input_layout = QHBoxLayout()
         input_layout.setSpacing(6)
         input_layout.addWidget(make_label("Input File:"))
-
         self.input_label = QLabel("Drag & drop or use Record / Browse")
         self.input_label.setStyleSheet("""
             QLabel {
@@ -1714,7 +2544,6 @@ class SubtitleGeneratorGUI(QMainWindow):
             }
         """)
         input_layout.addWidget(self.input_label, 1)
-
         self.unload_btn = QPushButton("×")
         self.unload_btn.setFixedWidth(28)
         self.unload_btn.setMinimumHeight(28)
@@ -1734,64 +2563,58 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.unload_btn.clicked.connect(self.unload_file)
         self.unload_btn.setVisible(False)
         input_layout.addWidget(self.unload_btn)
-
         self.browse_btn = QPushButton("📁 Browse...")
         self.browse_btn.setStyleSheet(BTN_STYLE)
         self.browse_btn.clicked.connect(self.browse_input)
         input_layout.addWidget(self.browse_btn)
-        file_layout.addLayout(input_layout)
-
+        io_content_layout.addLayout(input_layout)
         rec_layout = QHBoxLayout()
         rec_layout.setSpacing(6)
         rec_layout.addWidget(make_label("Quick Record:"))
-
         self.rec_btn = QPushButton("🎤 Start Record")
         self.rec_btn.setFixedWidth(130)
         self.rec_btn.setStyleSheet(BTN_STYLE)
         self.rec_btn.clicked.connect(self.toggle_recording)
-
         self.pause_btn = QPushButton("⏸ Pause")
         self.pause_btn.setEnabled(False)
         self.pause_btn.setStyleSheet(BTN_STYLE)
         self.pause_btn.clicked.connect(self.toggle_rec_pause)
-
         self.rec_vol_bar = QProgressBar()
         self.rec_vol_bar.setMaximum(100)
         self.rec_vol_bar.setTextVisible(False)
         self.rec_vol_bar.setFixedHeight(8)
         self.rec_vol_bar.setStyleSheet(PROGRESSBAR_STYLE)
-
         rec_layout.addWidget(self.rec_btn)
         rec_layout.addWidget(self.pause_btn)
         rec_layout.addWidget(make_label("Level:"))
         rec_layout.addWidget(self.rec_vol_bar)
-        file_layout.addLayout(rec_layout)
+        io_content_layout.addLayout(rec_layout)
+        self.io_content.setLayout(io_content_layout)
+        io_main_layout.addWidget(self.io_content)
+        layout.addWidget(io_container)
 
-        output_layout = QHBoxLayout()
-        output_layout.setSpacing(6)
-        output_layout.addWidget(make_label("Output File:"))
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Auto-generated (same name as input, .srt extension)")
-        self.output_edit.setStyleSheet(INPUT_STYLE)
-        output_layout.addWidget(self.output_edit, 1)
-        self.browse_output_btn = QPushButton("💾 Browse...")
-        self.browse_output_btn.setStyleSheet(BTN_STYLE)
-        self.browse_output_btn.clicked.connect(self.browse_output)
-        output_layout.addWidget(self.browse_output_btn)
-        file_layout.addLayout(output_layout)
-
-        file_group.setLayout(file_layout)
-        layout.addWidget(file_group)
-
-        self.waveform_group = QGroupBox("Audio Waveform & Playback")
-        self.waveform_group.setStyleSheet(GROUPBOX_STYLE)
+        # ─────────────────────────────────────────────────
+        # AUDIO WAVEFORM SECTION
+        # ─────────────────────────────────────────────────
+        self.waveform_toggle_container = QWidget()
+        self.waveform_toggle_container.setStyleSheet("background: transparent;")
+        self.waveform_toggle_container.setVisible(False)
+        waveform_main_layout = QVBoxLayout(self.waveform_toggle_container)
+        waveform_main_layout.setContentsMargins(0, 0, 0, 0)
+        waveform_main_layout.setSpacing(4)
+        self.waveform_toggle = QPushButton("▼ 🌊 Audio Waveform")
+        self.waveform_toggle.setCheckable(True)
+        self.waveform_toggle.setChecked(True)
+        self.waveform_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
+        self.waveform_toggle.clicked.connect(self.toggle_waveform_section)
+        waveform_main_layout.addWidget(self.waveform_toggle)
+        self.waveform_content = QGroupBox()
+        self.waveform_content.setStyleSheet(CONTENT_GROUP_STYLE)
         waveform_layout = QVBoxLayout()
         waveform_layout.setSpacing(6)
         waveform_layout.setContentsMargins(10, 14, 10, 10)
-
         playback_layout = QHBoxLayout()
         playback_layout.setSpacing(6)
-
         self.play_btn = QPushButton("▶ Play")
         self.play_btn.setFixedWidth(85)
         self.play_btn.setStyleSheet("""
@@ -1807,36 +2630,30 @@ class SubtitleGeneratorGUI(QMainWindow):
         """)
         self.play_btn.clicked.connect(self.toggle_playback)
         playback_layout.addWidget(self.play_btn)
-
         self.stop_btn = QPushButton("⏹ Stop")
         self.stop_btn.setFixedWidth(85)
         self.stop_btn.setStyleSheet(BTN_STYLE)
         self.stop_btn.clicked.connect(self.stop_playback)
         playback_layout.addWidget(self.stop_btn)
-
         self.reset_btn = QPushButton("⏮ Reset")
         self.reset_btn.setFixedWidth(85)
         self.reset_btn.setStyleSheet(BTN_STYLE)
         self.reset_btn.clicked.connect(self.reset_playback)
         playback_layout.addWidget(self.reset_btn)
-
         playback_layout.addWidget(make_label("Position:"))
         self.playback_position_label = QLabel("0.00s")
         self.playback_position_label.setStyleSheet("color: #e0e0e0; font-size: 12px; font-weight: bold;")
         playback_layout.addWidget(self.playback_position_label)
         playback_layout.addStretch()
         waveform_layout.addLayout(playback_layout)
-
         self.waveform_display = WaveformWidget()
         self.waveform_display.view_changed.connect(self.update_waveform_scrollbar)
         self.waveform_display.seek_requested.connect(self.on_seek_requested)
         self.waveform_display.selections_changed.connect(self.on_waveform_selection_changed)
         waveform_layout.addWidget(self.waveform_display)
-
         self.waveform_scrollbar_container = QWidget()
         scrollbar_layout = QHBoxLayout(self.waveform_scrollbar_container)
         scrollbar_layout.setContentsMargins(0, 0, 0, 0)
-
         self.waveform_scroll = QScrollBar(Qt.Orientation.Horizontal)
         self.waveform_scroll.setMinimum(0)
         self.waveform_scroll.setMaximum(1000)
@@ -1858,64 +2675,66 @@ class SubtitleGeneratorGUI(QMainWindow):
         """)
         self.waveform_scroll.sliderMoved.connect(self.on_scroll_user_change)
         self.waveform_scroll.valueChanged.connect(self.on_scroll_user_change)
-
         self.waveform_scrollbar_container.setVisible(False)
         scrollbar_layout.addWidget(self.waveform_scroll)
         waveform_layout.addWidget(self.waveform_scrollbar_container)
-
         self.waveform_info = QLabel("Status: Ready")
         self.waveform_info.setStyleSheet("color: #555555; font-size: 10px;")
         waveform_layout.addWidget(self.waveform_info)
+        self.waveform_content.setLayout(waveform_layout)
+        waveform_main_layout.addWidget(self.waveform_content)
+        layout.addWidget(self.waveform_toggle_container)
 
-        self.waveform_group.setLayout(waveform_layout)
-        self.waveform_group.setVisible(False)
-        layout.addWidget(self.waveform_group)
-
+        # ─────────────────────────────────────────────────
+        # FRAGMENTS SECTION
+        # ─────────────────────────────────────────────────
+        self.fragments_container = QWidget()
+        self.fragments_container.setStyleSheet("background: transparent;")
+        fragments_main_layout = QVBoxLayout(self.fragments_container)
+        fragments_main_layout.setContentsMargins(0, 0, 0, 0)
+        fragments_main_layout.setSpacing(4)
+        self.fragments_toggle = QPushButton("▶ 🎯 Optional: Select Fragments")
+        self.fragments_toggle.setCheckable(True)
+        self.fragments_toggle.setChecked(False)
+        self.fragments_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
+        self.fragments_toggle.clicked.connect(self.toggle_fragments_settings)
+        fragments_main_layout.addWidget(self.fragments_toggle)
         self.range_group = self.create_range_section()
         self.range_group.setVisible(False)
-        layout.addWidget(self.range_group)
+        fragments_main_layout.addWidget(self.range_group)
+        self.fragments_container.setVisible(False)
+        layout.addWidget(self.fragments_container)
 
+        # ─────────────────────────────────────────────────
+        # SETTINGS ROW
+        # ─────────────────────────────────────────────────
         model_group_container = QWidget()
         model_group_container.setStyleSheet("background: transparent;")
         model_group_main_layout = QVBoxLayout(model_group_container)
         model_group_main_layout.setContentsMargins(0, 0, 0, 0)
         model_group_main_layout.setSpacing(4)
-
-        self.model_settings_toggle = QPushButton("▶  ⚙️  Model Settings")
+        self.model_settings_toggle = QPushButton("▶ ⚙️ Model Settings")
         self.model_settings_toggle.setCheckable(True)
         self.model_settings_toggle.setChecked(False)
         self.model_settings_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
         self.model_settings_toggle.clicked.connect(self.toggle_model_settings)
         model_group_main_layout.addWidget(self.model_settings_toggle)
-
         self.model_settings_content = QGroupBox()
         self.model_settings_content.setVisible(False)
-        self.model_settings_content.setMinimumWidth(850)
-        self.model_settings_content.setStyleSheet("""
-            QGroupBox {
-                background-color: #1c1c1c;
-                border: 1px solid #2e2e2e;
-                border-radius: 4px;
-                margin-top: 0px;
-            }
-        """)
+        self.model_settings_content.setStyleSheet(CONTENT_GROUP_STYLE)
         model_layout = QVBoxLayout()
         model_layout.setSpacing(10)
         model_layout.setContentsMargins(15, 12, 15, 12)
-
         device_layout = QHBoxLayout()
         device_layout.setSpacing(8)
         device_layout.addWidget(make_label("Device:"))
-
         self.device_group = QButtonGroup()
         self.cpu_radio = QRadioButton("CPU")
         self.cpu_radio.setStyleSheet(RADIO_STYLE)
         self.gpu_radio = QRadioButton("GPU (CUDA)")
         self.gpu_radio.setStyleSheet(RADIO_STYLE)
-
         self.device_group.addButton(self.cpu_radio)
         self.device_group.addButton(self.gpu_radio)
-
         if torch.cuda.is_available():
             self.gpu_radio.setChecked(True)
             try:
@@ -1927,19 +2746,13 @@ class SubtitleGeneratorGUI(QMainWindow):
             self.cpu_radio.setChecked(True)
             self.gpu_radio.setEnabled(False)
             self.gpu_radio.setToolTip("CUDA not available on this system")
-
-        self.cpu_radio.toggled.connect(self.update_tf32_visibility)
-        self.gpu_radio.toggled.connect(self.update_tf32_visibility)
-
         device_layout.addWidget(self.cpu_radio)
         device_layout.addWidget(self.gpu_radio)
         device_layout.addStretch()
         model_layout.addLayout(device_layout)
-
         model_size_layout = QHBoxLayout()
         model_size_layout.setSpacing(8)
         model_size_layout.addWidget(make_label("WhisperX Model:"))
-
         self.model_combo = QComboBox()
         self.model_combo.addItems([
             "tiny", "tiny.en",
@@ -1948,14 +2761,12 @@ class SubtitleGeneratorGUI(QMainWindow):
             "medium", "medium.en",
             "large-v3"
         ])
-        self.model_combo.setCurrentText("small")
+        self.model_combo.setCurrentText("large-v3")
         self.model_combo.setStyleSheet(COMBO_STYLE)
-
         model_size_layout.addWidget(self.model_combo)
         model_size_layout.addWidget(make_label("(larger = better quality, slower)"))
         model_size_layout.addStretch()
         model_layout.addLayout(model_size_layout)
-
         lang_layout = QHBoxLayout()
         lang_layout.setSpacing(8)
         lang_layout.addWidget(make_label("Language:"))
@@ -1967,7 +2778,6 @@ class SubtitleGeneratorGUI(QMainWindow):
         lang_layout.addWidget(make_label("(ISO code: en, pl, es, fr, de, etc. or leave empty for auto-detect)"))
         lang_layout.addStretch()
         model_layout.addLayout(lang_layout)
-
         batch_layout = QHBoxLayout()
         batch_layout.setSpacing(8)
         batch_layout.addWidget(make_label("Batch Size:"))
@@ -1980,150 +2790,398 @@ class SubtitleGeneratorGUI(QMainWindow):
         batch_layout.addWidget(make_label("(higher = faster, more VRAM)"))
         batch_layout.addStretch()
         model_layout.addLayout(batch_layout)
-
+        model_layout.addStretch()
         self.model_settings_content.setLayout(model_layout)
         model_group_main_layout.addWidget(self.model_settings_content)
-        layout.addWidget(model_group_container)
 
+        # Audio Processing
+        audio_proc_group_container = QWidget()
+        audio_proc_group_container.setStyleSheet("background: transparent;")
+        audio_proc_group_main_layout = QVBoxLayout(audio_proc_group_container)
+        audio_proc_group_main_layout.setContentsMargins(0, 0, 0, 0)
+        audio_proc_group_main_layout.setSpacing(4)
+        self.audio_proc_settings_toggle = QPushButton("▶ 🎛️ Audio Processing")
+        self.audio_proc_settings_toggle.setCheckable(True)
+        self.audio_proc_settings_toggle.setChecked(False)
+        self.audio_proc_settings_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
+        self.audio_proc_settings_toggle.clicked.connect(self.toggle_audio_processing)
+        audio_proc_group_main_layout.addWidget(self.audio_proc_settings_toggle)
+        self.audio_proc_settings_content = QGroupBox()
+        self.audio_proc_settings_content.setVisible(False)
+        self.audio_proc_settings_content.setStyleSheet(CONTENT_GROUP_STYLE)
+        audio_proc_layout = QVBoxLayout()
+        audio_proc_layout.setSpacing(10)
+        audio_proc_layout.setContentsMargins(15, 12, 15, 12)
+
+        voice_sep_layout = QHBoxLayout()
+        voice_sep_layout.setSpacing(8)
+        self.voice_separation_check = QCheckBox("🎵 Voice Separation (Demucs)")
+        self.voice_separation_check.setChecked(False)
+        self.voice_separation_check.setStyleSheet(CHECKBOX_STYLE)
+        self.voice_separation_check.setToolTip(
+            "Extract vocals from audio before transcription.\n"
+            "Improves accuracy for files with background music or noise."
+        )
+        voice_sep_layout.addWidget(self.voice_separation_check)
+        voice_sep_layout.addWidget(make_label("(Separates vocal from audio — only the vocal is processed.)"))
+        voice_sep_layout.addStretch()
+        audio_proc_layout.addLayout(voice_sep_layout)
+
+        reuse_layout = QHBoxLayout()
+        reuse_layout.setSpacing(8)
+        self.reuse_check = QCheckBox("🔊 Voice Enhancement (RE-USE)")
+        self.reuse_check.setChecked(False)
+        self.reuse_check.setStyleSheet(CHECKBOX_STYLE)
+        self.reuse_check.setToolTip(
+            "Apply NVIDIA RE-USE neural speech enhancement before transcription.\n"
+            "Significantly improves speech clarity in noisy or degraded recordings.\n"
+            "Applied after Voice Separation (if enabled), before Audio Effects.\n"
+            "Enhanced audio is saved permanently to RE-USE_outputs/ folder.\n"
+            "Model is downloaded automatically on first use."
+        )
+        reuse_layout.addWidget(self.reuse_check)
+        reuse_layout.addWidget(make_label("(Neural voice enhancement — high VRAM requirement)"))
+        reuse_layout.addStretch()
+        audio_proc_layout.addLayout(reuse_layout)
+
+        # Chunking BEFORE Bandwidth Extension
+        self.reuse_chunk_container = self._create_reuse_chunk_container(
+            CHECKBOX_STYLE, SPINBOX_STYLE, LABEL_STYLE
+        )
+        audio_proc_layout.addWidget(self.reuse_chunk_container)
+
+        # Bandwidth Extension (teraz POD chunkingiem)
+        self.bwe_container = QWidget()
+        bwe_layout = QHBoxLayout(self.bwe_container)
+        bwe_layout.setSpacing(8)
+        bwe_lbl = make_label("Bandwidth Extension:")
+        bwe_lbl.setStyleSheet("color: #888888; font-size: 12px;")
+        self.bwe_combo = QComboBox()
+        self.bwe_combo.addItem("Disabled (preserve original SR)", 0)
+        self.bwe_combo.addItem("→ 8 kHz", 8000)
+        self.bwe_combo.addItem("→ 16 kHz (best for WhisperX)", 16000)
+        self.bwe_combo.addItem("→ 22 kHz", 22050)
+        self.bwe_combo.addItem("→ 24 kHz", 24000)
+        self.bwe_combo.addItem("→ 32 kHz", 32000)
+        self.bwe_combo.addItem("→ 44.1 kHz", 44100)
+        self.bwe_combo.addItem("→ 48 kHz (max)", 48000)
+        self.bwe_combo.setCurrentIndex(0)
+        self.bwe_combo.setStyleSheet(COMBO_STYLE)
+        self.bwe_combo.setFixedWidth(220)
+        bwe_layout.addWidget(bwe_lbl)
+        bwe_layout.addWidget(self.bwe_combo)
+        bwe_layout.addStretch()
+        audio_proc_layout.addWidget(self.bwe_container)
+        self.bwe_container.setVisible(False)
+
+        sep_ap1 = QFrame()
+        sep_ap1.setFrameShape(QFrame.Shape.HLine)
+        sep_ap1.setStyleSheet("background-color: #2e2e2e; border: none; max-height: 1px;")
+        audio_proc_layout.addWidget(sep_ap1)
+
+        pb_header = QLabel("Audio Effects")
+        pb_header.setStyleSheet(
+            "color: #aaaaaa; font-size: 11px; font-weight: bold; letter-spacing: 1px;"
+        )
+        audio_proc_layout.addWidget(pb_header)
+
+        pb_grid = QGridLayout()
+        pb_grid.setSpacing(8)
+        pb_grid.setColumnMinimumWidth(0, 130)
+        pb_grid.setColumnMinimumWidth(1, 80)
+        pb_grid.setColumnMinimumWidth(2, 100)
+        pb_grid.setColumnMinimumWidth(3, 60)
+        pb_grid.setColumnMinimumWidth(4, 110)
+        pb_grid.setColumnStretch(6, 1)
+
+        self.ng_check = QCheckBox("Noise Gate")
+        self.ng_check.setChecked(False)
+        self.ng_check.setStyleSheet(CHECKBOX_STYLE)
+        self.ng_check.setToolTip(
+            "Silences audio that falls below the threshold.\n"
+            "Effective at removing background hiss and noise between words."
+        )
+        pb_grid.addWidget(self.ng_check, 0, 0)
+        pb_grid.addWidget(make_fixed_label("Threshold:", 80), 0, 1)
+        self.ng_threshold_spin = QDoubleSpinBox()
+        self.ng_threshold_spin.setRange(-80.0, 0.0)
+        self.ng_threshold_spin.setValue(-38.0)
+        self.ng_threshold_spin.setSuffix(" dB")
+        self.ng_threshold_spin.setSingleStep(1.0)
+        self.ng_threshold_spin.setFixedWidth(100)
+        self.ng_threshold_spin.setStyleSheet(SPINBOX_STYLE)
+        self.ng_threshold_spin.setEnabled(False)
+        pb_grid.addWidget(self.ng_threshold_spin, 0, 2)
+        pb_grid.addWidget(make_fixed_label("Release:", 60), 0, 3)
+        self.ng_release_spin = QDoubleSpinBox()
+        self.ng_release_spin.setRange(10.0, 2000.0)
+        self.ng_release_spin.setValue(180.0)
+        self.ng_release_spin.setSuffix(" ms")
+        self.ng_release_spin.setSingleStep(10.0)
+        self.ng_release_spin.setFixedWidth(110)
+        self.ng_release_spin.setStyleSheet(SPINBOX_STYLE)
+        self.ng_release_spin.setEnabled(False)
+        pb_grid.addWidget(self.ng_release_spin, 0, 4)
+        self.ng_check.toggled.connect(self.ng_threshold_spin.setEnabled)
+        self.ng_check.toggled.connect(self.ng_release_spin.setEnabled)
+
+        self.hp_check = QCheckBox("High-Pass Filter")
+        self.hp_check.setChecked(False)
+        self.hp_check.setStyleSheet(CHECKBOX_STYLE)
+        self.hp_check.setToolTip(
+            "Removes frequencies below the cutoff.\n"
+            "Useful for eliminating low-frequency rumble, hum, and microphone vibration."
+        )
+        pb_grid.addWidget(self.hp_check, 1, 0)
+        pb_grid.addWidget(make_fixed_label("Cutoff:", 80), 1, 1)
+        self.hp_cutoff_spin = QDoubleSpinBox()
+        self.hp_cutoff_spin.setRange(20.0, 1000.0)
+        self.hp_cutoff_spin.setValue(82.0)
+        self.hp_cutoff_spin.setSuffix(" Hz")
+        self.hp_cutoff_spin.setSingleStep(5.0)
+        self.hp_cutoff_spin.setFixedWidth(100)
+        self.hp_cutoff_spin.setStyleSheet(SPINBOX_STYLE)
+        self.hp_cutoff_spin.setEnabled(False)
+        pb_grid.addWidget(self.hp_cutoff_spin, 1, 2)
+        self.hp_check.toggled.connect(self.hp_cutoff_spin.setEnabled)
+
+        self.comp_check = QCheckBox("Compressor")
+        self.comp_check.setChecked(False)
+        self.comp_check.setStyleSheet(CHECKBOX_STYLE)
+        self.comp_check.setToolTip(
+            "Reduces the dynamic range of the audio.\n"
+            "Brings quieter speech to a more consistent level, improving Whisper accuracy."
+        )
+        pb_grid.addWidget(self.comp_check, 2, 0)
+        pb_grid.addWidget(make_fixed_label("Threshold:", 80), 2, 1)
+        self.comp_threshold_spin = QDoubleSpinBox()
+        self.comp_threshold_spin.setRange(-60.0, 0.0)
+        self.comp_threshold_spin.setValue(-23.0)
+        self.comp_threshold_spin.setSuffix(" dB")
+        self.comp_threshold_spin.setSingleStep(1.0)
+        self.comp_threshold_spin.setFixedWidth(100)
+        self.comp_threshold_spin.setStyleSheet(SPINBOX_STYLE)
+        self.comp_threshold_spin.setEnabled(False)
+        pb_grid.addWidget(self.comp_threshold_spin, 2, 2)
+        pb_grid.addWidget(make_fixed_label("Ratio:", 60), 2, 3)
+        self.comp_ratio_spin = QDoubleSpinBox()
+        self.comp_ratio_spin.setRange(1.0, 20.0)
+        self.comp_ratio_spin.setValue(4.5)
+        self.comp_ratio_spin.setSuffix(" :1")
+        self.comp_ratio_spin.setSingleStep(0.5)
+        self.comp_ratio_spin.setFixedWidth(110)
+        self.comp_ratio_spin.setStyleSheet(SPINBOX_STYLE)
+        self.comp_ratio_spin.setEnabled(False)
+        pb_grid.addWidget(self.comp_ratio_spin, 2, 4)
+        self.comp_check.toggled.connect(self.comp_threshold_spin.setEnabled)
+        self.comp_check.toggled.connect(self.comp_ratio_spin.setEnabled)
+
+        self.gain_check = QCheckBox("Gain")
+        self.gain_check.setChecked(False)
+        self.gain_check.setStyleSheet(CHECKBOX_STYLE)
+        self.gain_check.setToolTip("Adjusts the overall volume level of the audio.")
+        pb_grid.addWidget(self.gain_check, 3, 0)
+        pb_grid.addWidget(make_fixed_label("Gain:", 80), 3, 1)
+        self.gain_db_spin = QDoubleSpinBox()
+        self.gain_db_spin.setRange(-20.0, 20.0)
+        self.gain_db_spin.setValue(3.0)
+        self.gain_db_spin.setSuffix(" dB")
+        self.gain_db_spin.setSingleStep(0.5)
+        self.gain_db_spin.setFixedWidth(100)
+        self.gain_db_spin.setStyleSheet(SPINBOX_STYLE)
+        self.gain_db_spin.setEnabled(False)
+        pb_grid.addWidget(self.gain_db_spin, 3, 2)
+        self.gain_check.toggled.connect(self.gain_db_spin.setEnabled)
+
+        audio_proc_layout.addLayout(pb_grid)
+        audio_proc_layout.addStretch()
+
+        self.audio_proc_settings_content.setLayout(audio_proc_layout)
+        audio_proc_group_main_layout.addWidget(self.audio_proc_settings_content)
+
+        # Advanced Settings
         advanced_group_container = QWidget()
         advanced_group_container.setStyleSheet("background: transparent;")
         advanced_group_main_layout = QVBoxLayout(advanced_group_container)
         advanced_group_main_layout.setContentsMargins(0, 0, 0, 0)
         advanced_group_main_layout.setSpacing(4)
-
-        self.advanced_settings_toggle = QPushButton("▶  🔧  Advanced Settings")
+        self.advanced_settings_toggle = QPushButton("▶ 🔧 Advanced Settings")
         self.advanced_settings_toggle.setCheckable(True)
         self.advanced_settings_toggle.setChecked(False)
         self.advanced_settings_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
         self.advanced_settings_toggle.clicked.connect(self.toggle_advanced_settings)
         advanced_group_main_layout.addWidget(self.advanced_settings_toggle)
-
         self.advanced_settings_content = QGroupBox()
         self.advanced_settings_content.setVisible(False)
-        self.advanced_settings_content.setMinimumWidth(850)
-        self.advanced_settings_content.setStyleSheet("""
-            QGroupBox {
-                background-color: #1c1c1c;
-                border: 1px solid #2e2e2e;
-                border-radius: 4px;
-                margin-top: 0px;
-            }
-        """)
+        self.advanced_settings_content.setStyleSheet(CONTENT_GROUP_STYLE)
         advanced_layout = QVBoxLayout()
         advanced_layout.setSpacing(10)
         advanced_layout.setContentsMargins(15, 12, 15, 12)
-
-        self.tf32_container = QWidget()
-        self.tf32_container.setStyleSheet("background: transparent;")
-        tf32_layout = QHBoxLayout(self.tf32_container)
-        tf32_layout.setContentsMargins(0, 0, 0, 0)
-        tf32_layout.setSpacing(8)
-        self.tf32_check = QCheckBox("Enable TF32 (faster, slightly less accurate)")
-        self.tf32_check.setChecked(False)
-        self.tf32_check.setStyleSheet(CHECKBOX_STYLE)
-        tf32_layout.addWidget(self.tf32_check)
-        tf32_layout.addWidget(make_label("(only for NVIDIA RTX 30xx/40xx+ GPUs)"))
-        tf32_layout.addStretch()
-        advanced_layout.addWidget(self.tf32_container)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #2e2e2e; border: none; max-height: 1px;")
-        advanced_layout.addWidget(sep)
-
-        voice_sep_layout = QHBoxLayout()
-        voice_sep_layout.setSpacing(8)
-        self.voice_separation_check = QCheckBox("🎵 Voice Separation")
-        self.voice_separation_check.setChecked(False)
-        self.voice_separation_check.setStyleSheet(CHECKBOX_STYLE)
-        self.voice_separation_check.setToolTip(
-            "Extract vocals from audio before transcription.\n"
-            "Improves accuracy for files with background music or noise.\n"
-            "⚠️ Significantly increases processing time."
-        )
-        voice_sep_layout.addWidget(self.voice_separation_check)
-        voice_sep_layout.addWidget(make_label("(Separates vocal from audio — only the vocal is processed.)"))
-        voice_sep_layout.addStretch()
-        advanced_layout.addLayout(voice_sep_layout)
-
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("background-color: #2e2e2e; border: none; max-height: 1px;")
-        advanced_layout.addWidget(sep2)
-
-        pattern_layout = QHBoxLayout()
-        pattern_layout.setSpacing(8)
-        pattern_layout.addWidget(make_label("Word Pattern:"))
+        adv_grid = QGridLayout()
+        adv_grid.setSpacing(8)
+        adv_grid.setColumnMinimumWidth(0, 155)
+        adv_grid.setColumnMinimumWidth(1, 150)
+        adv_grid.setColumnStretch(2, 1)
         self.pattern_edit = QLineEdit("3,4")
         self.pattern_edit.setMaximumWidth(150)
         self.pattern_edit.setStyleSheet(INPUT_STYLE)
-        pattern_layout.addWidget(self.pattern_edit)
-        pattern_layout.addWidget(make_label("(e.g., 3,4 = alternating 3 and 4 words per subtitle)"))
-        pattern_layout.addStretch()
-        advanced_layout.addLayout(pattern_layout)
-
-        pause_layout = QHBoxLayout()
-        pause_layout.setSpacing(8)
-        pause_layout.addWidget(make_label("Min Pause for Split:"))
+        label_word_pattern = make_fixed_label("Word Pattern:", 155)
+        label_word_pattern.setToolTip("e.g., 3,4 = alternating 3 and 4 words per subtitle")
+        adv_grid.addWidget(label_word_pattern, 0, 0)
+        adv_grid.addWidget(self.pattern_edit, 0, 1)
         self.min_pause_spin = QDoubleSpinBox()
         self.min_pause_spin.setRange(0.1, 3.0)
         self.min_pause_spin.setSingleStep(0.1)
         self.min_pause_spin.setValue(0.6)
         self.min_pause_spin.setSuffix(" s")
-        self.min_pause_spin.setMaximumWidth(100)
+        self.min_pause_spin.setFixedWidth(100)
         self.min_pause_spin.setStyleSheet(SPINBOX_STYLE)
-        pause_layout.addWidget(self.min_pause_spin)
-        pause_layout.addWidget(make_label("(pause between words to split subtitle)"))
-        pause_layout.addStretch()
-        advanced_layout.addLayout(pause_layout)
-
-        duration_layout = QHBoxLayout()
-        duration_layout.setSpacing(8)
-        duration_layout.addWidget(make_label("Min Subtitle Duration:"))
+        label_min_pause = make_fixed_label("Min Pause for Split:", 155)
+        label_min_pause.setToolTip("Pause between words to split subtitle")
+        adv_grid.addWidget(label_min_pause, 1, 0)
+        adv_grid.addWidget(self.min_pause_spin, 1, 1)
         self.min_duration_spin = QDoubleSpinBox()
         self.min_duration_spin.setRange(0.5, 5.0)
         self.min_duration_spin.setSingleStep(0.1)
         self.min_duration_spin.setValue(1.0)
         self.min_duration_spin.setSuffix(" s")
-        self.min_duration_spin.setMaximumWidth(100)
+        self.min_duration_spin.setFixedWidth(100)
         self.min_duration_spin.setStyleSheet(SPINBOX_STYLE)
-        duration_layout.addWidget(self.min_duration_spin)
-        duration_layout.addWidget(make_label("(merge subtitles shorter than this)"))
-        duration_layout.addStretch()
-        advanced_layout.addLayout(duration_layout)
-
-        line_layout = QHBoxLayout()
-        line_layout.setSpacing(8)
-        line_layout.addWidget(make_label("Max Line Length:"))
+        label_min_duration = make_fixed_label("Min Subtitle Duration:", 155)
+        label_min_duration.setToolTip("Merge subtitles shorter than this duration")
+        adv_grid.addWidget(label_min_duration, 2, 0)
+        adv_grid.addWidget(self.min_duration_spin, 2, 1)
         self.max_line_spin = QSpinBox()
         self.max_line_spin.setRange(20, 100)
         self.max_line_spin.setValue(42)
         self.max_line_spin.setSuffix(" chars")
-        self.max_line_spin.setMaximumWidth(100)
+        self.max_line_spin.setFixedWidth(100)
         self.max_line_spin.setStyleSheet(SPINBOX_STYLE)
-        line_layout.addWidget(self.max_line_spin)
-        line_layout.addWidget(make_label("(max characters per line, film standard = 42)"))
-        line_layout.addStretch()
-        advanced_layout.addLayout(line_layout)
-
+        label_max_line = make_fixed_label("Max Line Length:", 155)
+        label_max_line.setToolTip("Max characters per line, film standard = 42")
+        adv_grid.addWidget(label_max_line, 3, 0)
+        adv_grid.addWidget(self.max_line_spin, 3, 1)
+        advanced_layout.addLayout(adv_grid)
+        advanced_layout.addStretch()
         self.advanced_settings_content.setLayout(advanced_layout)
         advanced_group_main_layout.addWidget(self.advanced_settings_content)
-        layout.addWidget(advanced_group_container)
 
-        self.update_tf32_visibility()
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(10)
+        settings_row.addWidget(model_group_container, 1)
+        settings_row.addWidget(audio_proc_group_container, 1)
+        settings_row.addWidget(advanced_group_container, 1)
+        layout.addLayout(settings_row)
+
+        # ─────────────────────────────────────────────────
+        # WHISPER INPUT PREVIEW SECTION
+        # ─────────────────────────────────────────────────
+        self.whisper_preview_container = QWidget()
+        self.whisper_preview_container.setStyleSheet("background: transparent;")
+        whisper_preview_main_layout = QVBoxLayout(self.whisper_preview_container)
+        whisper_preview_main_layout.setContentsMargins(0, 0, 0, 0)
+        whisper_preview_main_layout.setSpacing(4)
+        self.whisper_preview_toggle = QPushButton("▶ 🎵 Whisper Input Preview")
+        self.whisper_preview_toggle.setCheckable(True)
+        self.whisper_preview_toggle.setChecked(False)
+        self.whisper_preview_toggle.setStyleSheet(TOGGLE_BTN_STYLE)
+        self.whisper_preview_toggle.clicked.connect(self.toggle_whisper_preview)
+        whisper_preview_main_layout.addWidget(self.whisper_preview_toggle)
+        self.whisper_preview_group = QGroupBox()
+        self.whisper_preview_group.setVisible(False)
+        self.whisper_preview_group.setStyleSheet(CONTENT_GROUP_STYLE)
+        whisper_wv_layout = QVBoxLayout()
+        whisper_wv_layout.setSpacing(6)
+        whisper_wv_layout.setContentsMargins(10, 12, 10, 10)
+        whisper_desc = QLabel(
+            "Audio sent directly to Whisper after all processing (region selection, voice separation)."
+        )
+        whisper_desc.setStyleSheet("color: #555555; font-size: 10px; font-style: italic;")
+        whisper_wv_layout.addWidget(whisper_desc)
+        whisper_playback_row = QHBoxLayout()
+        whisper_playback_row.setSpacing(6)
+        self.whisper_play_btn = QPushButton("▶ Play")
+        self.whisper_play_btn.setFixedWidth(85)
+        self.whisper_play_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1e5fa8, stop:1 #133f74);
+                color: white; font-weight: bold; font-size: 12px;
+                padding: 5px 10px; border-radius: 4px; border: 1px solid #2a6aaa;
+            }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #2a72c8, stop:1 #1a4e8c); }
+            QPushButton:pressed { background: #0e3060; }
+        """)
+        self.whisper_play_btn.clicked.connect(self.toggle_whisper_playback)
+        whisper_playback_row.addWidget(self.whisper_play_btn)
+        self.whisper_stop_btn = QPushButton("⏹ Stop")
+        self.whisper_stop_btn.setFixedWidth(85)
+        self.whisper_stop_btn.setStyleSheet(BTN_STYLE)
+        self.whisper_stop_btn.clicked.connect(self.stop_whisper_playback)
+        whisper_playback_row.addWidget(self.whisper_stop_btn)
+        self.whisper_reset_btn = QPushButton("⏮ Reset")
+        self.whisper_reset_btn.setFixedWidth(85)
+        self.whisper_reset_btn.setStyleSheet(BTN_STYLE)
+        self.whisper_reset_btn.clicked.connect(self.reset_whisper_playback)
+        whisper_playback_row.addWidget(self.whisper_reset_btn)
+        whisper_playback_row.addWidget(make_label("Position:"))
+        self.whisper_position_label = QLabel("00:00:00")
+        self.whisper_position_label.setStyleSheet("color: #e0e0e0; font-size: 12px; font-weight: bold;")
+        whisper_playback_row.addWidget(self.whisper_position_label)
+        whisper_playback_row.addStretch()
+        whisper_wv_layout.addLayout(whisper_playback_row)
+        self.whisper_waveform_display = WaveformWidget()
+        self.whisper_waveform_display.selection_enabled = False
+        self.whisper_waveform_display.view_changed.connect(self.update_whisper_scrollbar)
+        self.whisper_waveform_display.seek_requested.connect(self.on_whisper_seek_requested)
+        whisper_wv_layout.addWidget(self.whisper_waveform_display)
+        self.whisper_scrollbar_container = QWidget()
+        whisper_scroll_layout = QHBoxLayout(self.whisper_scrollbar_container)
+        whisper_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self.whisper_waveform_scroll = QScrollBar(Qt.Orientation.Horizontal)
+        self.whisper_waveform_scroll.setMinimum(0)
+        self.whisper_waveform_scroll.setMaximum(1000)
+        self.whisper_waveform_scroll.setValue(0)
+        self.whisper_waveform_scroll.setStyleSheet("""
+            QScrollBar:horizontal {
+                background-color: #1a1a1a;
+                border: 1px solid #2e2e2e;
+                height: 12px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #3a3a3a;
+                border-radius: 3px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover { background-color: #2a6aaa; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+        """)
+        self.whisper_waveform_scroll.sliderMoved.connect(self.on_whisper_scroll_user_change)
+        self.whisper_waveform_scroll.valueChanged.connect(self.on_whisper_scroll_user_change)
+        self.whisper_scrollbar_container.setVisible(False)
+        whisper_scroll_layout.addWidget(self.whisper_waveform_scroll)
+        whisper_wv_layout.addWidget(self.whisper_scrollbar_container)
+        self.whisper_waveform_info = QLabel("Status: Waiting for generation to start...")
+        self.whisper_waveform_info.setStyleSheet("color: #555555; font-size: 10px;")
+        whisper_wv_layout.addWidget(self.whisper_waveform_info)
+        self.whisper_preview_group.setLayout(whisper_wv_layout)
+        whisper_preview_main_layout.addWidget(self.whisper_preview_group)
+        self.whisper_preview_container.setVisible(False)
+        layout.addWidget(self.whisper_preview_container)
 
         layout.addStretch()
         return widget
 
-    def update_tf32_visibility(self):
-        is_gpu = self.gpu_radio.isChecked()
-        self.tf32_container.setVisible(is_gpu)
-
-        if not is_gpu:
-            self.tf32_check.setChecked(False)
-
-        if self.advanced_settings_content.isVisible():
-            QTimer.singleShot(50, lambda: self._adjust_window_size())
+    def toggle_fragments_settings(self):
+        is_visible = self.fragments_toggle.isChecked()
+        self.range_group.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.fragments_toggle.setText(f"{arrow}  🎯  Optional: Select Fragments")
+        self.range_group.updateGeometry()
+        QApplication.processEvents()
+        QTimer.singleShot(40, self._adjust_window_size)
 
     def toggle_model_settings(self):
         is_visible = self.model_settings_toggle.isChecked()
@@ -2134,6 +3192,17 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.model_settings_content.updateGeometry()
         QApplication.processEvents()
 
+        QTimer.singleShot(40, lambda: self._adjust_window_size())
+
+    def toggle_audio_processing(self):
+        is_visible = self.audio_proc_settings_toggle.isChecked()
+        self.audio_proc_settings_content.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.audio_proc_settings_toggle.setText(f"{arrow}  🎛️  Audio Processing")
+ 
+        self.audio_proc_settings_content.updateGeometry()
+        QApplication.processEvents()
+ 
         QTimer.singleShot(40, lambda: self._adjust_window_size())
 
     def toggle_advanced_settings(self):
@@ -2147,30 +3216,272 @@ class SubtitleGeneratorGUI(QMainWindow):
 
         QTimer.singleShot(40, lambda: self._adjust_window_size())
 
-    def _adjust_window_size(self):
-        self.centralWidget().adjustSize()
-        self.centralWidget().updateGeometry()
+    def toggle_io_section(self):
+        is_visible = self.io_toggle.isChecked()
+        self.io_content.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.io_toggle.setText(f"{arrow} 📁 Input / Output")
+        if is_visible:
+            self._io_user_opened = True
+        QTimer.singleShot(50, self._adjust_window_size)
+
+    def toggle_waveform_section(self):
+        is_visible = self.waveform_toggle.isChecked()
+        self.waveform_content.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.waveform_toggle.setText(f"{arrow} 🌊 Audio Waveform")
+        if is_visible:
+            self._waveform_user_opened = True
+        QTimer.singleShot(50, self._adjust_window_size)
+
+    def _auto_expand_waveform(self):
+        if not self._io_user_opened and self.io_toggle.isChecked():
+            self.io_toggle.setChecked(False)
+            self.io_content.setVisible(False)
+            self.io_toggle.setText("▶ 📁 Input / Output")
+
+        self.waveform_toggle_container.setVisible(True)
+        if not self.waveform_toggle.isChecked():
+            self.waveform_toggle.setChecked(True)
+            self.waveform_content.setVisible(True)
+            self.waveform_toggle.setText("▼ 🌊 Audio Waveform")
+
+        self.fragments_container.setVisible(True)
+        QTimer.singleShot(50, self._adjust_window_size)
+
+    def _auto_expand_whisper(self):
+        if not self._waveform_user_opened and self.waveform_toggle.isChecked():
+            self.waveform_toggle.setChecked(False)
+            self.waveform_content.setVisible(False)
+            self.waveform_toggle.setText("▶ 🌊 Audio Waveform")
+
+        self.whisper_preview_container.setVisible(True)
+        if not self.whisper_preview_toggle.isChecked():
+            self.whisper_preview_toggle.setChecked(True)
+            self.whisper_preview_group.setVisible(True)
+            self.whisper_preview_toggle.setText("▼ 🎵 Whisper Input Preview")
+
+        QTimer.singleShot(50, self._adjust_window_size)
+
+    def toggle_whisper_preview(self):
+        is_visible = self.whisper_preview_toggle.isChecked()
+        self.whisper_preview_group.setVisible(is_visible)
+        arrow = "▼" if is_visible else "▶"
+        self.whisper_preview_toggle.setText(f"{arrow} 🎵 Whisper Input Preview")
+        if is_visible:
+            self._whisper_user_opened = True
+        self.whisper_preview_group.updateGeometry()
         QApplication.processEvents()
+        QTimer.singleShot(50, self._adjust_window_size)
 
-        content_size = self.centralWidget().sizeHint()
+    def _on_reuse_toggled(self):
+        enabled = self.reuse_check.isChecked()
+        self.bwe_container.setVisible(enabled)
+        self.reuse_chunk_container.setVisible(enabled)
+        if self.button_container.isVisible():
+            self._update_action_buttons_visibility()
 
-        needed_width = content_size.width() + 0
-        needed_height = content_size.height() + 10
+    def _on_reuse_fixed_toggled(self, checked: bool):
+        if checked and self.reuse_smart_check.isChecked():
+            self.reuse_smart_check.blockSignals(True)
+            self.reuse_smart_check.setChecked(False)
+            self.reuse_smart_sec_spin.setEnabled(False)
+            self.reuse_smart_check.blockSignals(False)
+        if self.button_container.isVisible():
+            self._update_action_buttons_visibility()
 
-        needed_width = max(needed_width, self.minimumWidth())
-        needed_height = max(needed_height, self.minimumHeight())
+    def _on_reuse_smart_toggled(self, checked: bool):
+        if checked and self.reuse_fixed_check.isChecked():
+            self.reuse_fixed_check.blockSignals(True)
+            self.reuse_fixed_check.setChecked(False)
+            self.reuse_fixed_sec_spin.setEnabled(False)
+            self.reuse_fixed_check.blockSignals(False)
+        if self.button_container.isVisible():
+            self._update_action_buttons_visibility()
 
-        self.resize(needed_width, needed_height)
+    def _get_audio_proc_state(self):
+        return (
+            self.language_edit.text().strip(),
+            self.voice_separation_check.isChecked(),
+            self.reuse_check.isChecked(),
+            self.bwe_combo.currentData(),
+            self.reuse_fixed_check.isChecked(),
+            self.reuse_smart_check.isChecked(),
+            self.reuse_fixed_sec_spin.value(),
+            self.reuse_smart_sec_spin.value(),
+            self.ng_check.isChecked(),
+            self.ng_threshold_spin.value(),
+            self.ng_release_spin.value(),
+            self.hp_check.isChecked(),
+            self.hp_cutoff_spin.value(),
+            self.comp_check.isChecked(),
+            self.comp_threshold_spin.value(),
+            self.comp_ratio_spin.value(),
+            self.gain_check.isChecked(),
+            self.gain_db_spin.value(),
+        )
 
-    def update_tf32_visibility(self):
-        is_gpu = self.gpu_radio.isChecked()
-        self.tf32_container.setVisible(is_gpu)
+    def _any_audio_proc_checked(self):
+        return (
+            self.voice_separation_check.isChecked()
+            or self.reuse_check.isChecked()
+            or self.ng_check.isChecked()
+            or self.hp_check.isChecked()
+            or self.comp_check.isChecked()
+            or self.gain_check.isChecked()
+        )
 
-        if not is_gpu:
-            self.tf32_check.setChecked(False)
+    def _update_action_buttons_visibility(self):
+        if not self._any_audio_proc_checked():
+            self.process_btn.setVisible(True)
+            self.export_text_btn.setVisible(True)
+            self.check_audio_btn.setVisible(False)
+        else:
+            current_include, current_exclude = self.parse_time_ranges()
+            state_matches = (
+                self._get_audio_proc_state() == self._last_checked_audio_proc_state
+                and current_include == self._cached_audio_include_ranges
+                and current_exclude == self._cached_audio_exclude_ranges
+            )
+            cache_valid = (
+                self._cached_processed_audio_path is not None
+                and Path(self._cached_processed_audio_path).exists()
+            )
+            if state_matches and cache_valid:
+                self._audio_proc_waveform_ready = True
+            elif not state_matches:
+                self._audio_proc_waveform_ready = False
+            self.check_audio_btn.setVisible(True)
+            self.check_audio_btn.setEnabled(not state_matches and not self.processing)
+            if self._audio_proc_waveform_ready:
+                self.process_btn.setVisible(True)
+                self.export_text_btn.setVisible(True)
+            else:
+                self.process_btn.setVisible(False)
+                self.export_text_btn.setVisible(False)
+                
+    def _is_audio_cache_applicable(self, output_format):
+        if self._cached_processed_audio_path is None:
+            return False
+        if not Path(self._cached_processed_audio_path).exists():
+            return False
+        if self._get_audio_proc_state() != self._last_checked_audio_proc_state:
+            return False
+        current_include, current_exclude = self.parse_time_ranges()
+        if output_format == 'srt' and current_exclude and not current_include:
+            return False
+        if current_include != self._cached_audio_include_ranges:
+            return False
+        if current_exclude != self._cached_audio_exclude_ranges:
+            return False
+        return True
 
-        if self.advanced_settings_content.isVisible():
-            QTimer.singleShot(50, lambda: self._adjust_window_size())
+    def _on_audio_proc_changed(self):
+        if self.button_container.isVisible():
+            self._update_action_buttons_visibility()
+
+    def start_check_audio(self):
+        if not self.input_file or not self.input_file.exists():
+            QMessageBox.warning(self, "Error", "Please select a valid input file.")
+            return
+        device = "cuda" if self.gpu_radio.isChecked() else "cpu"
+        pedalboard_cfg = {
+            "noise_gate_enabled": self.ng_check.isChecked(),
+            "noise_gate_threshold": self.ng_threshold_spin.value(),
+            "noise_gate_release": self.ng_release_spin.value(),
+            "highpass_enabled": self.hp_check.isChecked(),
+            "highpass_cutoff": self.hp_cutoff_spin.value(),
+            "compressor_enabled": self.comp_check.isChecked(),
+            "compressor_threshold": self.comp_threshold_spin.value(),
+            "compressor_ratio": self.comp_ratio_spin.value(),
+            "gain_enabled": self.gain_check.isChecked(),
+            "gain_db": self.gain_db_spin.value(),
+        }
+        config = {
+            "device": device,
+            "voice_separation": self.voice_separation_check.isChecked(),
+            "reuse_enabled": self.reuse_check.isChecked(),
+            "reuse_model_dir": "./models/reuse",
+            "bwe": self.bwe_combo.currentData(),
+            "reuse_chunking_enabled": self.reuse_fixed_check.isChecked() or self.reuse_smart_check.isChecked(),
+            "reuse_chunk_mode": "smart" if self.reuse_smart_check.isChecked() else "fixed",
+            "reuse_chunk_seconds": self.reuse_smart_sec_spin.value() if self.reuse_smart_check.isChecked() else self.reuse_fixed_sec_spin.value(),
+            "pedalboard": pedalboard_cfg,
+            "word_pattern": [1],
+            "min_pause": 0.6,
+            "min_duration": 1.0,
+            "max_line_length": 42,
+            "batch_size": self.batch_spin.value(),
+            "language": self.language_edit.text().strip()
+        }
+        self._last_checked_audio_proc_state = self._get_audio_proc_state()
+        self.processing = True
+        self.check_audio_btn.setEnabled(False)
+        self.process_btn.setEnabled(False)
+        self.export_text_btn.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(0)
+        def worker():
+            try:
+                signals = WorkerSignals()
+                signals.whisper_audio_ready.connect(self.load_whisper_preview_waveform)
+                signals.check_audio_done.connect(self.on_check_audio_finished)
+                signals.error.connect(self.on_check_audio_error)
+                include_ranges, exclude_ranges = self.parse_time_ranges()
+                generator = SubtitleGenerator(config)
+                processed_path = generator.prepare_audio(
+                    self.input_file,
+                    include_ranges=include_ranges,
+                    exclude_ranges=exclude_ranges,
+                    audio_ready_callback=lambda path: signals.whisper_audio_ready.emit(path)
+                )
+                self._cached_processed_audio_path = processed_path
+                self._cached_audio_include_ranges = include_ranges
+                self._cached_audio_exclude_ranges = exclude_ranges
+                signals.check_audio_done.emit()
+            except Exception as e:
+                signals.error.emit(str(e) + "\n\n" + traceback.format_exc())
+        thread = Thread(target=worker, daemon=True)
+        thread.start()
+
+    def on_check_audio_finished(self):
+        self.processing = False
+        self.process_btn.setEnabled(True)
+        self.export_text_btn.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self._update_action_buttons_visibility()
+
+    def on_check_audio_error(self, error_msg):
+        self.processing = False
+        self._last_checked_audio_proc_state = None
+        self.browse_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self._update_action_buttons_visibility()
+        print("\n" + "="*60)
+        print("❌ ERROR - Check Audio failed")
+        print("="*60)
+        print(error_msg)
+        print("="*60 + "\n")
+        QMessageBox.critical(self, "Error", f"Check Audio failed:\n\n{error_msg}")
+
+    def _adjust_window_size(self):
+        if self.isMaximized() or self.isFullScreen():
+            return
+        central = self.centralWidget()
+        if central is None:
+            return
+        central_layout = central.layout()
+        if central_layout:
+            central_layout.activate()
+        QApplication.processEvents()
+        hint = central.sizeHint()
+        if not hint.isValid() or hint.height() <= 0:
+            return
+        new_w = max(hint.width(), self.minimumWidth())
+        new_h = max(hint.height() + 10, self.minimumHeight())
+        self.resize(new_w, new_h)
 
     def load_waveform(self, file_path):
         if not file_path:
@@ -2186,15 +3497,11 @@ class SubtitleGeneratorGUI(QMainWindow):
         print(f"▶ load_waveform starting for: {file_path.name}")
         self.waveform_info.setText("Status: Loading Waveform...")
 
-        self.waveform_group.setVisible(True)
-        self.range_group.setVisible(True)
-
-        QTimer.singleShot(100, self.adjustSize)
+        self._auto_expand_waveform()
 
         def worker():
             try:
                 print(f" Loading audio data...")
-
                 start_time = time.time()
 
                 video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v'}
@@ -2206,7 +3513,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                 if is_video:
                     print(f" Detected video file, extracting audio with FFmpeg...")
                     temp_audio_file = Path(tempfile.gettempdir()) / f"temp_audio_{file_path.stem}.wav"
-
                     try:
                         cmd = [
                             "ffmpeg", "-y",
@@ -2217,7 +3523,6 @@ class SubtitleGeneratorGUI(QMainWindow):
                             "-ac", "1",
                             str(temp_audio_file)
                         ]
-
                         result = subprocess.run(
                             cmd,
                             capture_output=True,
@@ -2226,13 +3531,10 @@ class SubtitleGeneratorGUI(QMainWindow):
                             errors='replace',
                             timeout=120
                         )
-
                         if result.returncode != 0:
                             raise RuntimeError(f"FFmpeg failed: {result.stderr}")
-
                         print(f" ✓ Audio extracted to temporary file")
                         audio_file_to_load = temp_audio_file
-
                     except FileNotFoundError:
                         raise RuntimeError(
                             "FFmpeg not found! Please install FFmpeg:\n"
@@ -2277,10 +3579,8 @@ class SubtitleGeneratorGUI(QMainWindow):
                         print(f" ✓ Resampling completed")
                     except ImportError:
                         print(f" WARNING: librosa not installed, cannot resample from {sample_rate}Hz")
-                        print(f" Install with: pip install librosa")
 
                 load_time = time.time() - start_time
-
                 print(f" ✓ Audio loaded in {load_time:.2f}s")
                 print(f" Audio shape: {audio_data.shape}, dtype: {audio_data.dtype}")
                 print(f" Audio range: [{audio_data.min():.4f}, {audio_data.max():.4f}]")
@@ -2310,10 +3610,12 @@ class SubtitleGeneratorGUI(QMainWindow):
             self.waveform_display.set_audio_data(audio_data)
 
             self.current_position = 0
-            self.playback_position_label.setText("0.00s")
+            self.playback_position_label.setText("00:00:00")
             self.waveform_display.set_playback_position(0)
 
             self.update_waveform_scrollbar(0.0, 1.0)
+
+            QTimer.singleShot(50, self._adjust_window_size)
 
         except Exception as e:
             print(f"ERROR in _update_waveform_data: {e}")
@@ -2321,15 +3623,13 @@ class SubtitleGeneratorGUI(QMainWindow):
 
     def on_waveform_selection_changed(self, selections):
         if not selections:
-            self.selection_info_label.setText("No regions selected - entire file will be processed")
+            self.selection_info_label.setText("No regions selected — entire file will be processed")
             self.selection_info_label.setStyleSheet(
-                "color: #888; "
-                "font-style: italic; "
-                "padding: 8px; "
-                "background-color: #f5f5f5; "
-                "border: 1px solid #ddd; "
-                "border-radius: 3px;"
+                "color: #888888; font-style: italic; padding: 6px 8px;"
+                "background-color: #161616; border: 1px solid #2e2e2e; border-radius: 3px;"
             )
+            if self.button_container.isVisible():
+                self._update_action_buttons_visibility()
             return
 
         include_count = 0
@@ -2349,21 +3649,20 @@ class SubtitleGeneratorGUI(QMainWindow):
 
         parts = []
         if include_count > 0:
-            parts.append(f"<span style='color: #9400D3; font-weight: bold;'>{include_count} INCLUDE</span>")
+            parts.append(f"<span style='color:#9b59b6; font-weight:bold;'>{include_count} INCLUDE</span>")
         if exclude_count > 0:
-            parts.append(f"<span style='color: #DC143C; font-weight: bold;'>{exclude_count} EXCLUDE</span>")
+            parts.append(f"<span style='color:#e74c3c; font-weight:bold;'>{exclude_count} EXCLUDE</span>")
 
         region_text = " + ".join(parts)
-        message = f"<b>{len(selections)} regions selected</b> ({region_text}) • Total: <b>{time_str}</b>"
+        message = f"<b style='color:#cccccc;'>{len(selections)} regions selected</b> ({region_text}) • Total: <b style='color:#cccccc;'>{time_str}</b>"
 
         self.selection_info_label.setText(message)
         self.selection_info_label.setStyleSheet(
-            "color: #333; "
-            "padding: 8px; "
-            "background-color: #e8f5e9; "
-            "border: 1px solid #4CAF50; "
-            "border-radius: 3px;"
+            "padding: 6px 8px;"
+            "background-color: #161616; border: 1px solid #2a6aaa; border-radius: 3px;"
         )
+        if self.button_container.isVisible():
+            self._update_action_buttons_visibility()
 
     def browse_input(self):
         file, _ = QFileDialog.getOpenFileName(
@@ -2375,16 +3674,21 @@ class SubtitleGeneratorGUI(QMainWindow):
         if file:
             self.input_file = Path(file)
             self.input_label.setText(self.input_file.name)
-            self.load_waveform(self.input_file)
-            self.input_label.setStyleSheet("color: black;")
+            self.input_label.setStyleSheet(
+                "color: #e0e0e0; background-color: #161616;"
+                "border: 1px solid #2e2e2e; border-radius: 3px;"
+                "padding: 5px 8px; font-size: 12px; font-style: normal;"
+            )
             self.unload_btn.setVisible(True)
             self.button_container.setVisible(True)
-
-            if not self.output_edit.text():
-                self.output_file = self.input_file.with_suffix(".srt")
-                self.output_edit.setText(str(self.output_file))
-
-            QTimer.singleShot(100, self.adjustSize)
+            self._last_checked_audio_proc_state = None
+            self._audio_proc_waveform_ready = False
+            self._cached_processed_audio_path = None
+            self._cached_audio_include_ranges = None
+            self._cached_audio_exclude_ranges = None
+            self._update_action_buttons_visibility()
+            self.load_waveform(self.input_file)
+            QTimer.singleShot(100, self._adjust_window_size)
 
     def browse_output(self):
         file, _ = QFileDialog.getSaveFileName(
@@ -2455,101 +3759,139 @@ class SubtitleGeneratorGUI(QMainWindow):
 
     def toggle_rec_pause(self):
         is_paused = self.recorder.toggle_pause()
-        self.pause_btn.setText("▶ Wznów" if is_paused else "⏸ Pauza")
+        self.pause_btn.setText("▶ Resume" if is_paused else "⏸ Pause")
 
     def on_recording_finished(self, path):
-
         time.sleep(0.3)
-
         file_path = Path(path)
-
         if not file_path.exists():
             print(f"ERROR: Recording file not found: {path}")
             return
-
         file_size = file_path.stat().st_size
         if file_size == 0:
             print(f"ERROR: Recording file is empty: {path}")
             return
-
         print(f"✓ Recording file verified: {file_path.name} ({file_size / 1024:.1f} KB)")
-
         self.input_file = file_path
         self.input_label.setText(f"Recorded: {self.input_file.name}")
         self.input_label.setStyleSheet("color: #2196F3; font-weight: bold;")
         self.unload_btn.setVisible(True)
         self.button_container.setVisible(True)
-
-        self.output_file = self.input_file.with_suffix(".srt")
-        self.output_edit.setText(str(self.output_file))
-
-        self.waveform_group.setVisible(True)
-        self.range_group.setVisible(True)
-
+        self._last_checked_audio_proc_state = None
+        self._audio_proc_waveform_ready = False
+        self._cached_processed_audio_path = None
+        self._cached_audio_include_ranges = None
+        self._cached_audio_exclude_ranges = None
+        self._update_action_buttons_visibility()
         print(f"▶ Loading waveform for: {self.input_file}")
         self.load_waveform(self.input_file)
-
-        QTimer.singleShot(100, self.adjustSize)
+        QTimer.singleShot(100, self._adjust_window_size)
 
     def unload_file(self):
         if self.playing:
             self.stop_playback()
-
+        if self.whisper_playing:
+            self.stop_whisper_playback()
         self.input_file = None
         self.audio_data = None
         self.current_position = 0
-
-        self.input_label.setText("Drag & drop or use Record/Browse")
-        self.input_label.setStyleSheet("color: gray; font-style: italic;")
+        self.whisper_audio_data = None
+        self.whisper_current_position = 0
+        self._audio_proc_waveform_ready = False
+        self._last_checked_audio_proc_state = None
+        self._cached_processed_audio_path = None
+        self._cached_audio_include_ranges = None
+        self._cached_audio_exclude_ranges = None
+        self._io_user_opened = False
+        self._waveform_user_opened = False
+        self._whisper_user_opened = False
+        self.input_label.setText("Drag & drop or use Record / Browse")
+        self.input_label.setStyleSheet("""
+            QLabel {
+                color: #555555;
+                background-color: #161616;
+                border: 1px dashed #2e2e2e;
+                border-radius: 3px;
+                padding: 5px 8px;
+                font-style: italic;
+                font-size: 12px;
+            }
+        """)
         self.unload_btn.setVisible(False)
         self.button_container.setVisible(False)
-
-        self.waveform_group.setVisible(False)
+        self.waveform_toggle_container.setVisible(False)
+        self.waveform_toggle.setChecked(True)
+        self.waveform_content.setVisible(True)
+        self.waveform_toggle.setText("▼ 🌊 Audio Waveform")
+        self.io_toggle.setChecked(True)
+        self.io_content.setVisible(True)
+        self.io_toggle.setText("▼ 📁 Input / Output")
+        self.fragments_container.setVisible(False)
+        self.fragments_toggle.setChecked(False)
         self.range_group.setVisible(False)
-
+        self.fragments_toggle.setText("▶ 🎯 Optional: Select Fragments")
         self.waveform_display.set_audio_data(None)
-
-        self.output_edit.clear()
-        self.output_file = None
-
+        self.waveform_scrollbar_container.setVisible(False)
+        self.whisper_preview_container.setVisible(False)
+        self.whisper_preview_toggle.setChecked(False)
+        self.whisper_preview_group.setVisible(False)
+        self.whisper_preview_toggle.setText("▶ 🎵 Whisper Input Preview")
+        self.whisper_waveform_display.set_audio_data(None)
+        self.whisper_position_label.setText("00:00:00")
+        self.whisper_waveform_info.setText("Status: Waiting for generation to start...")
+        self.whisper_scrollbar_container.setVisible(False)
         print("File unloaded successfully")
+        QTimer.singleShot(50, self._adjust_window_size)
 
-        QTimer.singleShot(100, self.adjustSize)
+    def _fmt_position(self, seconds: float) -> str:
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        return f"{h:02d}:{m:02d}:{sec:02d}"
 
     def on_seek_requested(self, time_seconds):
         self.current_position = max(0.0, time_seconds)
-        self.playback_position_label.setText(f"{self.current_position:.2f}s")
+        self.playback_position_label.setText(self._fmt_position(self.current_position))
         self.waveform_display.set_playback_position(self.current_position)
-
         print(f"Seek to: {self.current_position:.2f}s")
 
     def update_waveform_scrollbar(self, offset, zoom):
         if self.waveform_display.audio_data is not None:
-             duration = self.waveform_display.duration
-             self.waveform_info.setText(
-                f"Duration: {duration:.2f}s | Zoom: {zoom:.1f}x | "
+            duration = self.waveform_display.duration
+            total_s = int(duration)
+            h = total_s // 3600
+            m = (total_s % 3600) // 60
+            s = total_s % 60
+            dur_fmt = f"{h:02d}:{m:02d}:{s:02d}"
+            self.waveform_info.setText(
+                f"Duration: {dur_fmt} | Zoom: {zoom:.1f}x | "
                 "LMB+Drag to pan, Scroll to zoom, Click to seek"
             )
 
-        if zoom > 1.0:
-            self.waveform_scrollbar_container.setVisible(True)
+        currently_visible = self.waveform_scrollbar_container.isVisible()
 
+        if zoom > 1.0:
             self.waveform_scroll.blockSignals(True)
 
             max_scroll = self.waveform_scroll.maximum()
-
             max_offset_val = 1.0 - (1.0 / zoom)
 
             if max_offset_val > 0:
                 scroll_val = int((offset / max_offset_val) * max_scroll)
                 self.waveform_scroll.setValue(scroll_val)
-
                 page_step = int((1.0 / zoom) / max_offset_val * max_scroll) if max_offset_val > 0 else max_scroll
                 self.waveform_scroll.setPageStep(min(page_step, max_scroll))
 
             self.waveform_scroll.blockSignals(False)
+
+            if not currently_visible:
+                self.waveform_scrollbar_container.setVisible(True)
+                QTimer.singleShot(40, self._adjust_window_size)
         else:
-            self.waveform_scrollbar_container.setVisible(False)
+            if currently_visible:
+                self.waveform_scrollbar_container.setVisible(False)
+                QTimer.singleShot(40, self._adjust_window_size)
 
     def on_scroll_user_change(self, value):
         zoom = self.waveform_display.zoom_factor
@@ -2562,6 +3904,158 @@ class SubtitleGeneratorGUI(QMainWindow):
             new_offset = (value / max_scroll) * max_offset_val
 
             self.waveform_display.set_view_offset(new_offset)
+
+    def load_whisper_preview_waveform(self, file_path_str: str):
+        file_path = Path(file_path_str)
+        if not file_path.exists():
+            return
+
+        self._audio_proc_waveform_ready = True
+        self.whisper_waveform_info.setText("Status: Loading Whisper Preview...")
+
+        self._auto_expand_whisper()
+
+        def worker():
+            try:
+                audio_data, sample_rate = sf.read(str(file_path), dtype='float32')
+                if len(audio_data.shape) > 1:
+                    audio_data = audio_data.mean(axis=1)
+                if sample_rate != 16000:
+                    try:
+                        audio_data = librosa.resample(audio_data, orig_sr=sample_rate, target_sr=16000)
+                    except ImportError:
+                        pass
+                if len(audio_data) == 0:
+                    return
+                self.whisper_audio_loaded_signal.emit(audio_data)
+            except Exception as e:
+                print(f"ERROR loading whisper preview: {e}")
+                QTimer.singleShot(0, lambda: self.whisper_waveform_info.setText(f"Status: Error — {str(e)}"))
+
+        thread = Thread(target=worker, daemon=True)
+        thread.start()
+ 
+    def _update_whisper_waveform_data(self, audio_data):
+        try:
+            self.whisper_audio_data = audio_data
+            self.whisper_waveform_display.set_audio_data(audio_data)
+            self.whisper_current_position = 0
+            self.whisper_position_label.setText("00:00:00")
+            self.whisper_waveform_display.set_playback_position(0)
+            self.update_whisper_scrollbar(0.0, 1.0)
+        except Exception as e:
+            print(f"ERROR in _update_whisper_waveform_data: {e}")
+            traceback.print_exc()
+ 
+    def update_whisper_scrollbar(self, offset, zoom):
+        if self.whisper_waveform_display.audio_data is not None:
+            duration = self.whisper_waveform_display.duration
+            total_s = int(duration)
+            h = total_s // 3600
+            m = (total_s % 3600) // 60
+            s = total_s % 60
+            dur_fmt = f"{h:02d}:{m:02d}:{s:02d}"
+            self.whisper_waveform_info.setText(
+                f"Duration: {dur_fmt} | Zoom: {zoom:.1f}x | "
+                "LMB+Drag to pan, Scroll to zoom, Click to seek"
+            )
+ 
+        currently_visible = self.whisper_scrollbar_container.isVisible()
+ 
+        if zoom > 1.0:
+            self.whisper_waveform_scroll.blockSignals(True)
+            max_scroll = self.whisper_waveform_scroll.maximum()
+            max_offset_val = 1.0 - (1.0 / zoom)
+            if max_offset_val > 0:
+                scroll_val = int((offset / max_offset_val) * max_scroll)
+                self.whisper_waveform_scroll.setValue(scroll_val)
+                page_step = int((1.0 / zoom) / max_offset_val * max_scroll) if max_offset_val > 0 else max_scroll
+                self.whisper_waveform_scroll.setPageStep(min(page_step, max_scroll))
+            self.whisper_waveform_scroll.blockSignals(False)
+            if not currently_visible:
+                self.whisper_scrollbar_container.setVisible(True)
+                QTimer.singleShot(40, self._adjust_window_size)
+        else:
+            if currently_visible:
+                self.whisper_scrollbar_container.setVisible(False)
+                QTimer.singleShot(40, self._adjust_window_size)
+ 
+    def on_whisper_scroll_user_change(self, value):
+        zoom = self.whisper_waveform_display.zoom_factor
+        if zoom <= 1.0:
+            return
+        max_scroll = self.whisper_waveform_scroll.maximum()
+        max_offset_val = 1.0 - (1.0 / zoom)
+        if max_offset_val > 0:
+            new_offset = (value / max_scroll) * max_offset_val
+            self.whisper_waveform_display.set_view_offset(new_offset)
+ 
+    def on_whisper_seek_requested(self, time_seconds):
+        self.whisper_current_position = max(0.0, time_seconds)
+        self.whisper_position_label.setText(self._fmt_position(self.whisper_current_position))
+        self.whisper_waveform_display.set_playback_position(self.whisper_current_position)
+ 
+    def toggle_whisper_playback(self):
+        if self.whisper_audio_data is None:
+            return
+        if not self.whisper_playing:
+            self.start_whisper_playback()
+        else:
+            self.pause_whisper_playback()
+ 
+    def start_whisper_playback(self):
+        if self.whisper_audio_data is None:
+            return
+ 
+        self.whisper_playing = True
+        self.whisper_stop_playback_flag = False
+        self.whisper_play_btn.setText("⏸ Pause")
+ 
+        def playback_worker():
+            samplerate = 16000
+            try:
+                start_sample = int(self.whisper_current_position * samplerate)
+                audio_chunk = self.whisper_audio_data[start_sample:]
+                with sd.OutputStream(samplerate=samplerate, channels=1, dtype='float32') as stream:
+                    chunk_size = samplerate // 20
+                    for i in range(0, len(audio_chunk), chunk_size):
+                        if self.whisper_stop_playback_flag:
+                            break
+                        chunk = audio_chunk[i:i + chunk_size]
+                        if len(chunk) == 0:
+                            break
+                        if len(chunk) < chunk_size:
+                            chunk = np.pad(chunk, (0, chunk_size - len(chunk)), mode='constant')
+                        stream.write(chunk.reshape(-1, 1))
+                        self.whisper_current_position = (start_sample + i) / samplerate
+                        self.whisper_position_label.setText(self._fmt_position(self.whisper_current_position))
+                        self.whisper_waveform_display.set_playback_position(self.whisper_current_position)
+                self.whisper_playing = False
+                self.whisper_play_btn.setText("▶ Play")
+            except Exception as e:
+                print(f"Whisper preview playback error: {e}")
+                traceback.print_exc()
+                self.whisper_playing = False
+                self.whisper_play_btn.setText("▶ Play")
+ 
+        self.whisper_playback_thread = Thread(target=playback_worker, daemon=True)
+        self.whisper_playback_thread.start()
+ 
+    def pause_whisper_playback(self):
+        self.whisper_stop_playback_flag = True
+        self.whisper_playing = False
+        self.whisper_play_btn.setText("▶ Play")
+ 
+    def stop_whisper_playback(self):
+        self.whisper_stop_playback_flag = True
+        self.whisper_playing = False
+        self.whisper_play_btn.setText("▶ Play")
+ 
+    def reset_whisper_playback(self):
+        self.stop_whisper_playback()
+        self.whisper_current_position = 0
+        self.whisper_position_label.setText("00:00:00")
+        self.whisper_waveform_display.set_playback_position(0)
 
     def toggle_playback(self):
         if self.audio_data is None:
@@ -2619,7 +4113,7 @@ class SubtitleGeneratorGUI(QMainWindow):
                                 stream.write(chunk.reshape(-1, 1))
 
                                 self.current_position = (start_sample + i) / samplerate
-                                self.playback_position_label.setText(f"{self.current_position:.2f}s")
+                                self.playback_position_label.setText(self._fmt_position(self.current_position))
                                 self.waveform_display.set_playback_position(self.current_position)
                 else:
                     start_sample = int(self.current_position * samplerate)
@@ -2642,7 +4136,7 @@ class SubtitleGeneratorGUI(QMainWindow):
                             stream.write(chunk.reshape(-1, 1))
 
                             self.current_position = (start_sample + i) / samplerate
-                            self.playback_position_label.setText(f"{self.current_position:.2f}s")
+                            self.playback_position_label.setText(self._fmt_position(self.current_position))
                             self.waveform_display.set_playback_position(self.current_position)
 
                 self.playing = False
@@ -2670,7 +4164,7 @@ class SubtitleGeneratorGUI(QMainWindow):
     def reset_playback(self):
         self.stop_playback()
         self.current_position = 0
-        self.playback_position_label.setText("0.00s")
+        self.playback_position_label.setText("00:00:00")
         self.waveform_display.set_playback_position(0)
 
     def clear_selections(self):
@@ -2680,54 +4174,59 @@ class SubtitleGeneratorGUI(QMainWindow):
             self.waveform_display.update()
 
         if hasattr(self, 'selection_info_label'):
-            self.selection_info_label.setText("No regions selected - entire file will be processed")
+            self.selection_info_label.setText("No regions selected — entire file will be processed")
             self.selection_info_label.setStyleSheet(
-                "color: #888; "
-                "font-style: italic; "
-                "padding: 8px; "
-                "background-color: #f5f5f5; "
-                "border: 1px solid #ddd; "
-                "border-radius: 3px;"
+                "color: #888888; font-style: italic; padding: 6px 8px;"
+                "background-color: #161616; border: 1px solid #2e2e2e; border-radius: 3px;"
             )
 
     def create_range_section(self):
-        group = QGroupBox("Optional: Select Fragments")
+        group = QGroupBox()
+        group.setStyleSheet("""
+            QGroupBox {
+                background-color: #1c1c1c;
+                border: 1px solid #2e2e2e;
+                border-radius: 4px;
+                margin-top: 0px;
+            }
+        """)
         layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(15, 12, 15, 12)
 
         info_label = QLabel(
-            "<b>Keyboard Shortcuts:</b><br>"
-            "• <b>CTRL + Left Mouse drag</b> = Select regions to <span style='color: #9400D3;'><b>INCLUDE</b></span> (purple) - will be transcribed<br>"
-            "• <b>CTRL + Right Mouse drag</b> = Select regions to <span style='color: #DC143C;'><b>EXCLUDE</b></span> (red) - will be muted/removed<br>"
-            "• Opposite mouse button acts as <b>eraser</b> for existing selections<br>"
+            "<b style='color:#aaaaaa;'>Keyboard Shortcuts:</b><br>"
+            "• <b style='color:#cccccc;'>CTRL + Left Mouse drag</b> = Select regions to "
+            "<span style='color:#9b59b6;'><b>INCLUDE</b></span> (purple) — will be transcribed<br>"
+            "• <b style='color:#cccccc;'>CTRL + Right Mouse drag</b> = Select regions to "
+            "<span style='color:#e74c3c;'><b>EXCLUDE</b></span> (red) — will be muted/removed<br>"
+            "• Opposite mouse button acts as <b style='color:#cccccc;'>eraser</b> for existing selections"
         )
-        info_label.setStyleSheet("color: #555; padding: 2px;")
+        info_label.setStyleSheet("color: #888888; font-size: 12px; padding: 2px;")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        self.selection_info_label = QLabel("No regions selected - entire file will be processed")
+        self.selection_info_label = QLabel("No regions selected — entire file will be processed")
         self.selection_info_label.setStyleSheet(
-            "color: #888; "
-            "font-style: italic; "
-            "padding: 8px; "
-            "background-color: #f5f5f5; "
-            "border: 1px solid #ddd; "
-            "border-radius: 3px;"
+            "color: #888888; font-style: italic; padding: 6px 8px;"
+            "background-color: #161616; border: 1px solid #2e2e2e; border-radius: 3px;"
         )
         layout.addWidget(self.selection_info_label)
 
-        clear_btn = QPushButton("🗑 Clear All Selections")
-        clear_btn.setFixedWidth(160)
+        clear_btn = QPushButton("🗑  Clear All Selections")
+        clear_btn.setFixedWidth(175)
         clear_btn.setStyleSheet("""
             QPushButton {
-                background-color: #B71C1C;
-                color: white;
+                background-color: #5a1a1a;
+                color: #ff8888;
                 font-weight: bold;
-                padding: 6px;
+                padding: 6px 10px;
                 border-radius: 4px;
+                border: 1px solid #882222;
+                font-size: 12px;
             }
-            QPushButton:hover {
-                background-color: #8B0000;
-            }
+            QPushButton:hover { background-color: #aa2222; color: white; }
+            QPushButton:disabled { background-color: #222; color: #555; border-color: #333; }
         """)
         clear_btn.clicked.connect(self.clear_selections)
         layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignRight)
@@ -2771,7 +4270,6 @@ class SubtitleGeneratorGUI(QMainWindow):
         if not self.input_file or not self.input_file.exists():
             QMessageBox.warning(self, "Error", "Please select a valid input file.")
             return
-
         pattern = self.parse_pattern(self.pattern_edit.text())
         if not pattern:
             QMessageBox.warning(
@@ -2780,19 +4278,39 @@ class SubtitleGeneratorGUI(QMainWindow):
                 "Invalid word pattern. Use comma-separated positive integers (e.g., 3,4)"
             )
             return
-
-        output_path = self.output_edit.text()
-        if output_path:
-            self.output_file = Path(output_path)
-        else:
-            self.output_file = self.input_file.with_suffix(".srt")
-
+        default_output = str(self.input_file.with_suffix(".srt"))
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Subtitle File",
+            default_output,
+            "SRT Files (*.srt);;All Files (*.*)"
+        )
+        if not output_path:
+            return
+        self.output_file = Path(output_path)
         device = "cuda" if self.gpu_radio.isChecked() else "cpu"
-
+        pedalboard_cfg = {
+            "noise_gate_enabled": self.ng_check.isChecked(),
+            "noise_gate_threshold": self.ng_threshold_spin.value(),
+            "noise_gate_release": self.ng_release_spin.value(),
+            "highpass_enabled": self.hp_check.isChecked(),
+            "highpass_cutoff": self.hp_cutoff_spin.value(),
+            "compressor_enabled": self.comp_check.isChecked(),
+            "compressor_threshold": self.comp_threshold_spin.value(),
+            "compressor_ratio": self.comp_ratio_spin.value(),
+            "gain_enabled": self.gain_check.isChecked(),
+            "gain_db": self.gain_db_spin.value(),
+        }
         config = {
             "device": device,
-            "enable_tf32": self.tf32_check.isChecked(),
             "voice_separation": self.voice_separation_check.isChecked(),
+            "reuse_enabled": self.reuse_check.isChecked(),
+            "reuse_model_dir": "./models/reuse",
+            "bwe": self.bwe_combo.currentData(),
+            "reuse_chunking_enabled": self.reuse_fixed_check.isChecked() or self.reuse_smart_check.isChecked(),
+            "reuse_chunk_mode": "smart" if self.reuse_smart_check.isChecked() else "fixed",
+            "reuse_chunk_seconds": self.reuse_smart_sec_spin.value() if self.reuse_smart_check.isChecked() else self.reuse_fixed_sec_spin.value(),
+            "pedalboard": pedalboard_cfg,
             "word_pattern": pattern,
             "min_pause": self.min_pause_spin.value(),
             "min_duration": self.min_duration_spin.value(),
@@ -2800,36 +4318,46 @@ class SubtitleGeneratorGUI(QMainWindow):
             "batch_size": self.batch_spin.value(),
             "language": self.language_edit.text().strip()
         }
-
         model_size = self.model_combo.currentText()
-
+        active_fx = []
+        if pedalboard_cfg["noise_gate_enabled"]: active_fx.append("NoiseGate")
+        if pedalboard_cfg["highpass_enabled"]: active_fx.append("Highpass")
+        if pedalboard_cfg["compressor_enabled"]: active_fx.append("Compressor")
+        if pedalboard_cfg["gain_enabled"]: active_fx.append("Gain")
+        chunk_info = "disabled"
+        if config["reuse_chunking_enabled"]:
+            chunk_info = f"{config['reuse_chunk_mode']} / {config['reuse_chunk_seconds']:.1f}s"
         print("\n" + "="*60)
-        print("  WhisperX Subtitle Generator v2.5")
-        print("  Mode: SUBTITLE GENERATION (.srt)")
+        print(" Subtitle Generator")
+        print(" Mode: SUBTITLE GENERATION (.srt)")
         print("="*60)
         print(f"Device: {device.upper()}")
         print(f"Model: {model_size}")
         print(f"Voice Separation: {'ENABLED ✓' if config['voice_separation'] else 'disabled'}")
+        print(f"RE-USE Enhancement: {'ENABLED ✓' if config['reuse_enabled'] else 'disabled'}")
+        print(f"RE-USE Chunking: {chunk_info}")
+        print(f"BWE: {config['bwe']} Hz")
+        print(f"Pedalboard FX: {', '.join(active_fx) if active_fx else 'disabled'}")
         print(f"Input: {self.input_file}")
         print(f"Output: {self.output_file}")
         print("="*60 + "\n")
-
         self.processing = True
         self.process_btn.setEnabled(False)
         self.export_text_btn.setEnabled(False)
+        self.check_audio_btn.setEnabled(False)
         self.browse_btn.setEnabled(False)
-        self.browse_output_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)
-
+        prebuilt = self._cached_processed_audio_path if self._is_audio_cache_applicable('srt') else None
+        if prebuilt:
+            print(f"✓ Reusing pre-built audio from Check Audio: {Path(prebuilt).name}")
         def worker():
             try:
                 signals = WorkerSignals()
                 signals.finished.connect(self.on_finished)
                 signals.error.connect(self.on_error)
-
+                signals.whisper_audio_ready.connect(self.load_whisper_preview_waveform)
                 include_ranges, exclude_ranges = self.parse_time_ranges()
-
                 self.generator = SubtitleGenerator(config)
                 result = self.generator.process(
                     self.input_file,
@@ -2837,13 +4365,13 @@ class SubtitleGeneratorGUI(QMainWindow):
                     model_size,
                     include_ranges=include_ranges,
                     exclude_ranges=exclude_ranges,
-                    output_format='srt'
+                    output_format='srt',
+                    audio_ready_callback=lambda path: signals.whisper_audio_ready.emit(path),
+                    prebuilt_audio_path=prebuilt
                 )
                 signals.finished.emit(result)
-
             except Exception as e:
                 signals.error.emit(str(e) + "\n\n" + traceback.format_exc())
-
         thread = Thread(target=worker, daemon=True)
         thread.start()
 
@@ -2851,15 +4379,39 @@ class SubtitleGeneratorGUI(QMainWindow):
         if not self.input_file or not self.input_file.exists():
             QMessageBox.warning(self, "Error", "Please select a valid input file.")
             return
-
-        text_output = self.input_file.with_suffix(".txt")
-
+        default_output = str(self.input_file.with_suffix(".txt"))
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Text Transcription",
+            default_output,
+            "Text Files (*.txt);;All Files (*.*)"
+        )
+        if not output_path:
+            return
+        text_output = Path(output_path)
         device = "cuda" if self.gpu_radio.isChecked() else "cpu"
-
+        pedalboard_cfg = {
+            "noise_gate_enabled": self.ng_check.isChecked(),
+            "noise_gate_threshold": self.ng_threshold_spin.value(),
+            "noise_gate_release": self.ng_release_spin.value(),
+            "highpass_enabled": self.hp_check.isChecked(),
+            "highpass_cutoff": self.hp_cutoff_spin.value(),
+            "compressor_enabled": self.comp_check.isChecked(),
+            "compressor_threshold": self.comp_threshold_spin.value(),
+            "compressor_ratio": self.comp_ratio_spin.value(),
+            "gain_enabled": self.gain_check.isChecked(),
+            "gain_db": self.gain_db_spin.value(),
+        }
         config = {
             "device": device,
-            "enable_tf32": self.tf32_check.isChecked(),
             "voice_separation": self.voice_separation_check.isChecked(),
+            "reuse_enabled": self.reuse_check.isChecked(),
+            "reuse_model_dir": "./models/reuse",
+            "bwe": self.bwe_combo.currentData(),
+            "reuse_chunking_enabled": self.reuse_fixed_check.isChecked() or self.reuse_smart_check.isChecked(),
+            "reuse_chunk_mode": "smart" if self.reuse_smart_check.isChecked() else "fixed",
+            "reuse_chunk_seconds": self.reuse_smart_sec_spin.value() if self.reuse_smart_check.isChecked() else self.reuse_fixed_sec_spin.value(),
+            "pedalboard": pedalboard_cfg,
             "word_pattern": [1],
             "min_pause": 0.6,
             "min_duration": 1.0,
@@ -2867,52 +4419,60 @@ class SubtitleGeneratorGUI(QMainWindow):
             "batch_size": self.batch_spin.value(),
             "language": self.language_edit.text().strip()
         }
-
         model_size = self.model_combo.currentText()
-
+        active_fx = []
+        if pedalboard_cfg["noise_gate_enabled"]: active_fx.append("NoiseGate")
+        if pedalboard_cfg["highpass_enabled"]: active_fx.append("Highpass")
+        if pedalboard_cfg["compressor_enabled"]: active_fx.append("Compressor")
+        if pedalboard_cfg["gain_enabled"]: active_fx.append("Gain")
+        chunk_info = "disabled"
+        if config["reuse_chunking_enabled"]:
+            chunk_info = f"{config['reuse_chunk_mode']} / {config['reuse_chunk_seconds']:.1f}s"
         print("\n" + "="*60)
-        print("  WhisperX Subtitle Generator v2.5")
-        print("  Mode: TEXT EXPORT (.txt)")
+        print(" Subtitle Generator")
+        print(" Mode: TEXT EXPORT (.txt)")
         print("="*60)
         print(f"Device: {device.upper()}")
         print(f"Model: {model_size}")
         print(f"Voice Separation: {'ENABLED ✓' if config['voice_separation'] else 'disabled'}")
+        print(f"RE-USE Enhancement: {'ENABLED ✓' if config['reuse_enabled'] else 'disabled'}")
+        print(f"RE-USE Chunking: {chunk_info}")
+        print(f"BWE: {config['bwe']} Hz")
+        print(f"Pedalboard FX: {', '.join(active_fx) if active_fx else 'disabled'}")
         print(f"Input: {self.input_file}")
         print(f"Output: {text_output}")
         print("="*60 + "\n")
-
         self.processing = True
         self.process_btn.setEnabled(False)
         self.export_text_btn.setEnabled(False)
+        self.check_audio_btn.setEnabled(False)
         self.browse_btn.setEnabled(False)
-        self.browse_output_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)
-
+        prebuilt = self._cached_processed_audio_path if self._is_audio_cache_applicable('txt') else None
+        if prebuilt:
+            print(f"✓ Reusing pre-built audio from Check Audio: {Path(prebuilt).name}")
         def worker():
             try:
                 signals = WorkerSignals()
                 signals.text_exported.connect(self.on_text_exported)
                 signals.error.connect(self.on_error)
-
+                signals.whisper_audio_ready.connect(self.load_whisper_preview_waveform)
                 include_ranges, exclude_ranges = self.parse_time_ranges()
-
                 generator = SubtitleGenerator(config)
-
                 generator.process(
                     self.input_file,
                     text_output,
                     model_size,
                     include_ranges=include_ranges,
                     exclude_ranges=exclude_ranges,
-                    output_format='txt'
+                    output_format='txt',
+                    audio_ready_callback=lambda path: signals.whisper_audio_ready.emit(path),
+                    prebuilt_audio_path=prebuilt
                 )
-
                 signals.text_exported.emit(str(text_output))
-
             except Exception as e:
                 signals.error.emit(str(e) + "\n\n" + traceback.format_exc())
-
         thread = Thread(target=worker, daemon=True)
         thread.start()
 
@@ -2921,13 +4481,11 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.process_btn.setEnabled(True)
         self.export_text_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
-        self.browse_output_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
-
+        self._update_action_buttons_visibility()
         print("\n" + "="*60)
         print("✓ SUCCESS - Subtitle generation completed")
         print("="*60 + "\n")
-
         QMessageBox.information(
             self,
             "Success",
@@ -2940,13 +4498,11 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.process_btn.setEnabled(True)
         self.export_text_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
-        self.browse_output_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
-
+        self._update_action_buttons_visibility()
         print("\n" + "="*60)
         print("✓ SUCCESS - Text export completed")
         print("="*60 + "\n")
-
         QMessageBox.information(
             self,
             "Success",
@@ -2959,15 +4515,13 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.process_btn.setEnabled(True)
         self.export_text_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
-        self.browse_output_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
-
+        self._update_action_buttons_visibility()
         print("\n" + "="*60)
         print("❌ ERROR - Processing failed")
         print("="*60)
         print(error_msg)
         print("="*60 + "\n")
-
         QMessageBox.critical(self, "Error", f"Processing failed:\n\n{error_msg}")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -2980,11 +4534,21 @@ class SubtitleGeneratorGUI(QMainWindow):
             file_path = Path(urls[0].toLocalFile())
             self.input_file = file_path
             self.input_label.setText(file_path.name)
-            self.input_label.setStyleSheet("color: black;")
-
-            if not self.output_edit.text():
-                self.output_file = file_path.with_suffix(".srt")
-                self.output_edit.setText(str(self.output_file))
+            self.input_label.setStyleSheet(
+                "color: #e0e0e0; background-color: #161616;"
+                "border: 1px solid #2e2e2e; border-radius: 3px;"
+                "padding: 5px 8px; font-size: 12px; font-style: normal;"
+            )
+            self.unload_btn.setVisible(True)
+            self.button_container.setVisible(True)
+            self._last_checked_audio_proc_state = None
+            self._audio_proc_waveform_ready = False
+            self._cached_processed_audio_path = None
+            self._cached_audio_include_ranges = None
+            self._cached_audio_exclude_ranges = None
+            self._update_action_buttons_visibility()
+            self.load_waveform(file_path)
+            QTimer.singleShot(100, self._adjust_window_size)
 
 def main():
     try:
