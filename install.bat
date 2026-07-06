@@ -64,6 +64,7 @@ echo.
 echo [1] CPU only
 echo [2] GPU (NVIDIA CUDA)
 echo.
+
 :CHOICE
 set USER_CHOICE=
 set /p USER_CHOICE=Enter choice [1/2]: 
@@ -126,7 +127,6 @@ if errorlevel 1 (
     exit /b 1
 )
 echo [OK] venv created.
-
 :: Absolute venv Python path (CRITICAL FIX)
 set "VENV_PY=%~dp0%VENV_DIR%\Scripts\python.exe"
 echo.
@@ -152,17 +152,17 @@ if errorlevel 1 (
 echo [OK] Requirements installed.
 
 :: ----------------------------------------------------------------
-:: [6] Force-reinstall PyTorch + torchaudio
+:: [6] Force-reinstall PyTorch + torchvision + torchaudio
 :: ----------------------------------------------------------------
 echo.
 echo [6/9] Force-reinstalling PyTorch (!TORCH_VARIANT!)...
-"%VENV_PY%" -m pip install torch torchaudio --index-url !TORCH_INDEX_URL! --force-reinstall --no-deps
+"%VENV_PY%" -m pip install torch torchvision torchaudio --index-url !TORCH_INDEX_URL! --force-reinstall --no-deps
 if errorlevel 1 (
     echo [ERROR] PyTorch installation failed.
     pause
     exit /b 1
 )
-echo [OK] PyTorch installed.
+echo [OK] PyTorch suite installed (torch, torchvision, torchaudio).
 
 :: ----------------------------------------------------------------
 :: [7] CUDA libs (if GPU)
