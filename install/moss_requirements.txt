@@ -1,0 +1,7 @@
+PyQt6
+numpy>=1.26,<3
+librosa
+sounddevice
+soundfile
+pysrt
+moss-transcribe-diarize @ https://github.com/OpenMOSS/MOSS-Transcribe-Diarize/archive/e3bdd93f8ad58418e04659818efd5fd87a0bc486.zip

@@ -1,0 +1,7 @@
+PyQt6
+numpy
+librosa
+sounddevice
+soundfile
+pysrt
+nemo_toolkit[asr]
